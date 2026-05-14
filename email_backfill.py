@@ -130,7 +130,8 @@ def fetch_raw_email(service, msg_id):
     ).execute()
     raw_bytes = base64.urlsafe_b64decode(msg["raw"])
 
-    headers_text = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="ignore")
+    headers_parts = raw_bytes.split(b"\r\n\r\n", 1)
+    headers_text = headers_parts[0].decode("utf-8", errors="ignore")
     headers = {}
     for line in headers_text.splitlines():
         if ":" in line and not line.startswith(" "):
@@ -140,7 +141,8 @@ def fetch_raw_email(service, msg_id):
     parsed_date = parse_date_safe(headers.get("date", ""))
     subject_safe = sanitize_for_filename(headers.get("subject", ""))
     from_raw = headers.get("from", "")
-    from_safe = sanitize_for_filename(from_raw.split("<")[0].strip() or from_raw, 40)
+    from_name = from_raw.split("<")[0].strip() or from_raw.strip()
+    from_safe = sanitize_for_filename(from_name, 40)
     return raw_bytes, parsed_date, subject_safe, from_safe
 
 
