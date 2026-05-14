@@ -1,35 +1,42 @@
 name: Email Backfill
 
 on:
+  # Runs every 30 minutes to sync newly arrived mail automatically.
+  schedule:
+    - cron: "*/30 * * * *"
+
+  # Manual trigger — choose historical (full 12-month catch-up),
+  # incremental (recent window), or custom (explicit date range).
   workflow_dispatch:
     inputs:
+      run_mode:
+        description: >
+          Run mode:
+          'historical' = auto-process last 12 months month by month;
+          'incremental' = sync recent mail (last 2 days);
+          'custom' = supply explicit start_date and end_date below.
+        required: false
+        default: "historical"
       start_date:
-        description: "Start date (YYYY/MM/DD)"
+        description: "Start date (YYYY/MM/DD) — only used when run_mode is 'custom'"
         required: false
+        default: ""
       end_date:
-        description: "End date (YYYY/MM/DD)"
+        description: "End date (YYYY/MM/DD) — only used when run_mode is 'custom'"
         required: false
-      months_back:
-        description: "Months to process when start/end are not provided"
-        required: false
-        default: "12"
+        default: ""
       max_emails:
-        description: "Max emails to process (default 5000)"
+        description: "Max emails to process per chunk (default 2000)"
         required: false
-        default: "5000"
+        default: "2000"
       aidrive_folder:
         description: "AI Drive destination folder"
         required: false
         default: "04 - EMAIL ARCHIVE"
-  schedule:
-    - cron: "0 2 * * *"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # A full rolling 12-month run can take hours on large mailboxes.
-    # If this limit is hit, reruns remain safe because processed messages are labeled.
-    timeout-minutes: 360
     permissions:
       contents: read
 
@@ -45,61 +52,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run email backfill ranges
+      - name: Run email backfill
         env:
           AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
+          AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
-          START_DATE_INPUT: ${{ inputs.start_date }}
-          END_DATE_INPUT: ${{ inputs.end_date }}
-          MONTHS_BACK_INPUT: ${{ inputs.months_back }}
-          MAX_EMAILS_INPUT: ${{ inputs.max_emails }}
-          AIDRIVE_FOLDER_INPUT: ${{ inputs.aidrive_folder }}
-        run: |
-          set -euo pipefail
-
-          MAX_EMAILS="${MAX_EMAILS_INPUT:-5000}"
-          AIDRIVE_FOLDER="${AIDRIVE_FOLDER_INPUT:-04 - EMAIL ARCHIVE}"
-          MONTHS_BACK="${MONTHS_BACK_INPUT:-12}"
-          RANGES_FILE="/tmp/backfill-ranges.txt"
-
-          if [[ -n "${START_DATE_INPUT:-}" || -n "${END_DATE_INPUT:-}" ]]; then
-            if [[ -z "${START_DATE_INPUT:-}" || -z "${END_DATE_INPUT:-}" ]]; then
-              echo "Both start_date and end_date must be provided together."
-              exit 1
-            fi
-            python .github/scripts/generate_backfill_ranges.py \
-              --start-date "${START_DATE_INPUT}" \
-              --end-date "${END_DATE_INPUT}" > "${RANGES_FILE}"
-          else
-            python .github/scripts/generate_backfill_ranges.py \
-              --months-back "${MONTHS_BACK}" > "${RANGES_FILE}"
-          fi
-
-          echo "Backfill ranges to process:"
-          cat "${RANGES_FILE}"
-
-          failed=0
-          while IFS='|' read -r label start_date end_date; do
-            echo "::group::${label} (${start_date} -> ${end_date})"
-            echo "Running ${label} with START_DATE=${start_date} END_DATE=${end_date}"
-
-            if START_DATE="${start_date}" \
-              END_DATE="${end_date}" \
-              MAX_EMAILS="${MAX_EMAILS}" \
-              AIDRIVE_FOLDER="${AIDRIVE_FOLDER}" \
-              python email_backfill.py; then
-              echo "${label} completed successfully."
-            else
-              echo "::warning::${label} failed, continuing to next range."
-              failed=1
-            fi
-
-            echo "::endgroup::"
-          done < "${RANGES_FILE}"
-
-          if [[ "${failed}" -ne 0 ]]; then
-            echo "One or more ranges failed. See grouped logs above."
-            exit 1
-          fi
+          # Scheduled runs always use incremental mode.
+          # Manual runs use the chosen run_mode (default: historical).
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'incremental' || github.event.inputs.run_mode || 'historical' }}
+          START_DATE: ${{ github.event.inputs.start_date || '' }}
+          END_DATE: ${{ github.event.inputs.end_date || '' }}
+          MAX_EMAILS: ${{ github.event.inputs.max_emails || '2000' }}
+        run: python email_backfill.py
