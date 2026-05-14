@@ -41,7 +41,10 @@ ENVIRONMENT VARIABLES:
   RUN_MODE                     "historical" | "incremental" | (empty = custom)
   START_DATE                   YYYY/MM/DD — required only in custom mode
   END_DATE                     YYYY/MM/DD — required only in custom mode
-  MAX_EMAILS                   (optional) cap per chunk, default 2000
+  MAX_EMAILS                   (optional) per-window cap on emails processed; in historical
+                               mode this limit is applied independently to each monthly
+                               chunk, so the total across all chunks can be much higher.
+                               Default 2000.
   INCREMENTAL_LOOKBACK_DAYS    (optional) days back for incremental, default 2
 
 USAGE:

@@ -108,8 +108,8 @@ No separate handling is needed.
 
 1. Refreshes Gmail credentials and ensures the `aidrive-archived` label exists.
 2. Depending on `RUN_MODE`:
-   - **historical** — generates 13 monthly date-range chunks covering the last
-     12 months and processes each in sequence.
+   - **historical** — generates up to 13 date-range chunks (12 complete past
+     months plus the current partial month) and processes each in sequence.
    - **incremental** — computes a 2-day lookback window ending tomorrow.
    - **custom** — uses the supplied `START_DATE` / `END_DATE` directly.
 3. For each window, lists message ids matching
