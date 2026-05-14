@@ -27,7 +27,8 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # A full rolling 12-month run can take hours depending on mailbox size.
+    # A full rolling 12-month run can take hours on large mailboxes.
+    # If this limit is hit, reruns remain safe because processed messages are labeled.
     timeout-minutes: 360
     permissions:
       contents: read

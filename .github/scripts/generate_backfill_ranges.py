@@ -60,12 +60,10 @@ def main():
         start_date = add_months(end_date, -args.months_back)
 
         current = start_date
-        chunk_number = 1
         while current < end_date:
             chunk_end = min(first_day_of_next_month(current), end_date)
-            ranges.append((f"auto-month-{chunk_number:02d}", current, chunk_end))
+            ranges.append((f"auto-{current.strftime('%Y-%m')}", current, chunk_end))
             current = chunk_end
-            chunk_number += 1
 
     for label, start_date, end_date in ranges:
         print(f"{label}|{format_date(start_date)}|{format_date(end_date)}")
