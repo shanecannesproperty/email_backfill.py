@@ -1,0 +1,47 @@
+name: Email Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY/MM/DD)"
+        required: true
+      end_date:
+        description: "End date (YYYY/MM/DD)"
+        required: true
+      max_emails:
+        description: "Max emails to process (default 5000)"
+        required: false
+        default: "5000"
+      aidrive_folder:
+        description: "AI Drive destination folder"
+        required: false
+        default: "04 - EMAIL ARCHIVE"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run email backfill
+        env:
+          AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
+          AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          MAX_EMAILS: ${{ github.event.inputs.max_emails }}
+        run: python email_backfill.py
