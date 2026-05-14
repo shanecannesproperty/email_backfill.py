@@ -22,11 +22,12 @@ on:
         required: false
         default: "04 - EMAIL ARCHIVE"
   schedule:
-    - cron: "17 2 * * *"
+    - cron: "0 2 * * *"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    # A full rolling 12-month run can take hours depending on mailbox size.
     timeout-minutes: 360
     permissions:
       contents: read
