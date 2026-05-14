@@ -1,18 +1,34 @@
 name: Email Backfill
 
 on:
+  # Runs every 30 minutes to sync newly arrived mail automatically.
+  schedule:
+    - cron: "*/30 * * * *"
+
+  # Manual trigger — choose historical (full 12-month catch-up),
+  # incremental (recent window), or custom (explicit date range).
   workflow_dispatch:
     inputs:
-      start_date:
-        description: "Start date (YYYY/MM/DD)"
-        required: true
-      end_date:
-        description: "End date (YYYY/MM/DD)"
-        required: true
-      max_emails:
-        description: "Max emails to process (default 5000)"
+      run_mode:
+        description: >
+          Run mode:
+          'historical' = auto-process last 12 months month by month;
+          'incremental' = sync recent mail (last 2 days);
+          'custom' = supply explicit start_date and end_date below.
         required: false
-        default: "5000"
+        default: "historical"
+      start_date:
+        description: "Start date (YYYY/MM/DD) — only used when run_mode is 'custom'"
+        required: false
+        default: ""
+      end_date:
+        description: "End date (YYYY/MM/DD) — only used when run_mode is 'custom'"
+        required: false
+        default: ""
+      max_emails:
+        description: "Max emails to process per chunk (default 2000)"
+        required: false
+        default: "2000"
       aidrive_folder:
         description: "AI Drive destination folder"
         required: false
@@ -39,11 +55,14 @@ jobs:
       - name: Run email backfill
         env:
           AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
-          AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder }}
+          AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
-          START_DATE: ${{ github.event.inputs.start_date }}
-          END_DATE: ${{ github.event.inputs.end_date }}
-          MAX_EMAILS: ${{ github.event.inputs.max_emails }}
+          # Scheduled runs always use incremental mode.
+          # Manual runs use the chosen run_mode (default: historical).
+          RUN_MODE: ${{ github.event_name == 'schedule' && 'incremental' || github.event.inputs.run_mode || 'historical' }}
+          START_DATE: ${{ github.event.inputs.start_date || '' }}
+          END_DATE: ${{ github.event.inputs.end_date || '' }}
+          MAX_EMAILS: ${{ github.event.inputs.max_emails || '2000' }}
         run: python email_backfill.py

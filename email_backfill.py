@@ -4,20 +4,45 @@ email_backfill.py
 Pulls emails from Gmail and uploads each one as a .eml file to AI Drive
 via the AI Drive API (signed-URL upload flow).
 
-Designed to run in GitHub Actions (no local install needed) but also runs
-locally. Idempotent: applies a Gmail label "aidrive-archived" to each
-processed email, so reruns skip already-uploaded messages.
+Designed to run unattended in GitHub Actions, but also runs locally.
 
-ENVIRONMENT VARIABLES (set as GitHub Secrets, or local .env):
+Idempotent: applies a Gmail label "aidrive-archived" to each successfully
+uploaded message, so reruns of the same date range skip already-processed
+messages — no duplicates.
 
-  AIDRIVE_API_KEY          your AI Drive API key
-  AIDRIVE_FOLDER           destination folder, e.g. "04 - EMAIL ARCHIVE"
-  GMAIL_CLIENT_ID          OAuth client id from Google Cloud Console
-  GMAIL_CLIENT_SECRET      OAuth client secret
-  GMAIL_REFRESH_TOKEN      refresh token obtained via get_gmail_token.py
-  START_DATE               YYYY/MM/DD, e.g. 2025/05/14
-  END_DATE                 YYYY/MM/DD, e.g. 2025/06/14
-  MAX_EMAILS               (optional) cap per run, default 5000
+ATTACHMENT HANDLING:
+  Gmail's "raw" format returns the complete RFC 822 message bytes, which
+  includes all MIME parts (body text, HTML alternatives, and every attachment).
+  When the script uploads this as a .eml file, attachments are already embedded
+  inside the payload. No separate attachment handling is required.
+
+OPERATING MODES (set via RUN_MODE environment variable):
+
+  historical   Automatically works through the last 12 months one calendar
+               month at a time. No START_DATE/END_DATE needed. Use this for
+               the initial catch-up or to fill any historical gaps.
+
+  incremental  Syncs the most recent emails (last INCREMENTAL_LOOKBACK_DAYS
+               days, default 2). Designed for the scheduled 30-minute run.
+               The label-based deduplication prevents double-uploads even
+               though the window is wider than 30 minutes.
+
+  (not set)    Falls back to custom mode: START_DATE and END_DATE must be
+               provided as YYYY/MM/DD values. Behaves exactly as before for
+               manual one-off runs.
+
+ENVIRONMENT VARIABLES:
+
+  AIDRIVE_API_KEY              your AI Drive API key
+  AIDRIVE_FOLDER               destination folder, e.g. "04 - EMAIL ARCHIVE"
+  GMAIL_CLIENT_ID              OAuth client id from Google Cloud Console
+  GMAIL_CLIENT_SECRET          OAuth client secret
+  GMAIL_REFRESH_TOKEN          refresh token obtained via get_gmail_token.py
+  RUN_MODE                     "historical" | "incremental" | (empty = custom)
+  START_DATE                   YYYY/MM/DD — required only in custom mode
+  END_DATE                     YYYY/MM/DD — required only in custom mode
+  MAX_EMAILS                   (optional) cap per chunk, default 2000
+  INCREMENTAL_LOOKBACK_DAYS    (optional) days back for incremental, default 2
 
 USAGE:
   python email_backfill.py
@@ -28,7 +53,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -52,9 +77,14 @@ AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
 GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
 GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
 GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
-START_DATE = os.environ["START_DATE"]
-END_DATE = os.environ["END_DATE"]
-MAX_EMAILS = int(os.environ.get("MAX_EMAILS", "5000"))
+# RUN_MODE: "historical" | "incremental" | "" (empty = custom, requires START/END)
+RUN_MODE = os.environ.get("RUN_MODE", "").strip().lower()
+START_DATE = os.environ.get("START_DATE", "")
+END_DATE = os.environ.get("END_DATE", "")
+MAX_EMAILS = int(os.environ.get("MAX_EMAILS", "2000"))
+# For incremental mode: how many calendar days back to query (2 days catches
+# all mail that arrived since the previous 30-minute run, even across midnight).
+INCREMENTAL_LOOKBACK_DAYS = int(os.environ.get("INCREMENTAL_LOOKBACK_DAYS", "2"))
 
 
 def log(msg):
@@ -290,20 +320,68 @@ def label_message_processed(service, msg_id, label_id):
     ).execute()
 
 
-def main():
-    log(
-        f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
-        f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
-    )
-    service = get_gmail_service()
-    label_id = ensure_processed_label(service)
-    log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+# ---------------------------------------------------------------------------
+# Date-range helpers
+# ---------------------------------------------------------------------------
 
-    query = f"after:{START_DATE} before:{END_DATE} -label:{PROCESSED_LABEL}"
-    log(f"Gmail query: {query}")
+def _add_months(d, months):
+    """Return the first day of the month `months` ahead of `d`."""
+    m = d.month - 1 + months
+    y = d.year + m // 12
+    m = m % 12 + 1
+    return date(y, m, 1)
+
+
+def _monthly_chunks(months_back=12):
+    """Yield (start_str, end_str) pairs covering the last `months_back` months.
+
+    Each pair is one calendar month expressed in Gmail query format YYYY/MM/DD.
+    The final chunk ends on tomorrow to include today's mail.
+    """
+    today = date.today()
+    current = _add_months(date(today.year, today.month, 1), -months_back)
+    while True:
+        next_m = _add_months(current, 1)
+        # Cap the end at tomorrow so we never query beyond today
+        end = min(next_m, today + timedelta(days=1))
+        yield current.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+        if next_m > today:
+            break
+        current = next_m
+
+
+def _incremental_window():
+    """Return (start_str, end_str) for the incremental lookback window.
+
+    Gmail's after:/before: filters are date-granular (YYYY/MM/DD), not
+    time-granular. We query the last INCREMENTAL_LOOKBACK_DAYS calendar days
+    to ensure we catch all mail that arrived since the previous scheduled run,
+    even across midnight boundaries. The aidrive-archived label prevents
+    re-uploading messages that were already processed.
+    """
+    today = date.today()
+    start = today - timedelta(days=INCREMENTAL_LOOKBACK_DAYS)
+    end = today + timedelta(days=1)
+    return start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+
+
+# ---------------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------------
+
+def process_window(service, label_id, start_str, end_str):
+    """Upload all unlabelled emails in [start_str, end_str) to AI Drive.
+
+    Returns (successes, failures, candidates) counts.
+    Emails are fetched as raw RFC 822 bytes (.eml), which include the full
+    message body AND all attachments embedded in the MIME structure — no
+    separate attachment handling is needed.
+    """
+    query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}"
+    log(f"  Gmail query: {query}")
 
     msg_ids = list(list_message_ids(service, query))
-    log(f"Found {len(msg_ids)} candidate emails")
+    log(f"  Found {len(msg_ids)} candidate email(s) in {start_str} – {end_str}")
 
     successes, failures = 0, 0
     batch = []  # list of dicts: msg_id, raw_bytes, drive_object, size_bytes, size_mb
@@ -325,7 +403,7 @@ def main():
         try:
             signed_responses = request_signed_urls(batch_meta)
         except Exception as e:
-            log(f"Batch signed-URL request failed: {e}. Skipping batch.")
+            log(f"  Batch signed-URL request failed: {e}. Skipping batch.")
             failures += len(batch)
             batch.clear()
             return
@@ -414,17 +492,104 @@ def main():
 
         if i % 100 == 0:
             log(
-                f"Progress: {i}/{len(msg_ids)} "
+                f"  Progress: {i}/{len(msg_ids)} "
                 f"(successes: {successes}, failures: {failures})"
             )
 
     flush_batch()
-    log(
-        f"Done. Successes: {successes}, Failures: {failures}, "
-        f"Total candidates: {len(msg_ids)}"
-    )
-    if failures > 0:
-        sys.exit(1)
+    return successes, failures, len(msg_ids)
+
+
+def main():
+    log("=" * 60)
+
+    if RUN_MODE == "historical":
+        # -------------------------------------------------------------------
+        # HISTORICAL mode: automatically process the last 12 months,
+        # one calendar month at a time.
+        # -------------------------------------------------------------------
+        log("MODE: historical — processing last 12 months month by month")
+        log(f"Folder: {AIDRIVE_FOLDER}. Per-chunk cap: {MAX_EMAILS}")
+        service = get_gmail_service()
+        label_id = ensure_processed_label(service)
+        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+
+        chunks = list(_monthly_chunks(months_back=12))
+        log(f"Total chunks to process: {len(chunks)}")
+
+        total_successes, total_failures, total_candidates = 0, 0, 0
+        for idx, (start_str, end_str) in enumerate(chunks, start=1):
+            log(f"\n[Chunk {idx}/{len(chunks)}] {start_str} → {end_str}")
+            s, f, c = process_window(service, label_id, start_str, end_str)
+            total_successes += s
+            total_failures += f
+            total_candidates += c
+            log(
+                f"[Chunk {idx}/{len(chunks)}] done — "
+                f"successes: {s}, failures: {f}, candidates: {c}"
+            )
+
+        log(
+            f"\nHistorical backfill complete. "
+            f"Total successes: {total_successes}, "
+            f"failures: {total_failures}, "
+            f"candidates: {total_candidates}"
+        )
+        if total_failures > 0:
+            sys.exit(1)
+
+    elif RUN_MODE == "incremental":
+        # -------------------------------------------------------------------
+        # INCREMENTAL mode: sync recent mail (scheduled every 30 minutes).
+        # Queries the last INCREMENTAL_LOOKBACK_DAYS days; the
+        # aidrive-archived label prevents re-uploading already-synced mail.
+        # -------------------------------------------------------------------
+        start_str, end_str = _incremental_window()
+        log(
+            f"MODE: incremental — syncing new mail "
+            f"(lookback {INCREMENTAL_LOOKBACK_DAYS} day(s): "
+            f"{start_str} → {end_str})"
+        )
+        log(f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
+        service = get_gmail_service()
+        label_id = ensure_processed_label(service)
+        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+
+        s, f, c = process_window(service, label_id, start_str, end_str)
+        log(
+            f"\nIncremental sync complete. "
+            f"Successes: {s}, failures: {f}, candidates: {c}"
+        )
+        if f > 0:
+            sys.exit(1)
+
+    else:
+        # -------------------------------------------------------------------
+        # CUSTOM mode: use explicit START_DATE and END_DATE (original behavior).
+        # -------------------------------------------------------------------
+        if not START_DATE or not END_DATE:
+            log(
+                "ERROR: RUN_MODE is not set. "
+                "Provide START_DATE and END_DATE for a custom range, "
+                "or set RUN_MODE=historical or RUN_MODE=incremental."
+            )
+            sys.exit(1)
+
+        log(
+            f"MODE: custom range — {START_DATE} → {END_DATE}. "
+            f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
+        )
+        service = get_gmail_service()
+        label_id = ensure_processed_label(service)
+        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+
+        s, f, c = process_window(service, label_id, START_DATE, END_DATE)
+        log(
+            f"\nCustom-range run complete. "
+            f"Successes: {s}, failures: {f}, candidates: {c}"
+        )
+        if f > 0:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
