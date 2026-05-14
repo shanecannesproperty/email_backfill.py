@@ -24,12 +24,14 @@ USAGE:
 """
 
 import base64
+import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 import requests
 from google.auth.transport.requests import Request as GoogleRequest
@@ -43,6 +45,15 @@ BATCH_SIZE = 25
 MAX_RETRIES = 3
 RETRY_DELAY_SECS = 5
 
+# === Config ===
+AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+PROCESSED_LABEL = "aidrive-archived"
+BATCH_SIZE = 25                # emails per signed-url batch
+MAX_RETRIES = 3
+RETRY_DELAY_SECS = 5
+
+# === Environment ===
 AIDRIVE_API_KEY = os.environ["AIDRIVE_API_KEY"]
 AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
 GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
@@ -72,6 +83,7 @@ def get_gmail_service():
 
 
 def ensure_processed_label(service):
+    """Returns the Gmail label id for aidrive-archived, creating it if needed."""
     labels = service.users().labels().list(userId="me").execute().get("labels", [])
     for lbl in labels:
         if lbl["name"] == PROCESSED_LABEL:
@@ -88,6 +100,7 @@ def ensure_processed_label(service):
 
 
 def sanitize_for_filename(text, max_len=80):
+    """Strip path-breaking chars and clip length."""
     if not text:
         return "no-subject"
     cleaned = re.sub(r'[\/\\:*?"<>|\r\n\t]', "_", text)
@@ -103,6 +116,7 @@ def parse_date_safe(date_header):
 
 
 def list_message_ids(service, query):
+    """Yields message ids for the query, paginated."""
     page_token = None
     fetched = 0
     while True:
@@ -123,6 +137,7 @@ def list_message_ids(service, query):
 
 
 def fetch_raw_email(service, msg_id):
+    """Returns (raw_bytes, parsed_date, subject_safe, from_safe)."""
     msg = service.users().messages().get(
         userId="me",
         id=msg_id,
@@ -132,6 +147,8 @@ def fetch_raw_email(service, msg_id):
 
     headers_parts = raw_bytes.split(b"\r\n\r\n", 1)
     headers_text = headers_parts[0].decode("utf-8", errors="ignore") if headers_parts else ""
+    # Parse minimal headers from the raw bytes for naming
+    headers_text = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="ignore")
     headers = {}
     for line in headers_text.splitlines():
         if ":" in line and not line.startswith(" "):
@@ -143,6 +160,7 @@ def fetch_raw_email(service, msg_id):
     from_raw = headers.get("from", "")
     from_name = from_raw.split("<")[0].strip() or from_raw.strip() or "unknown-sender"
     from_safe = sanitize_for_filename(from_name, 40)
+    from_safe = sanitize_for_filename(from_raw.split("<")[0].strip() or from_raw, 40)
     return raw_bytes, parsed_date, subject_safe, from_safe
 
 
@@ -166,6 +184,10 @@ def aidrive_headers():
 
 
 def request_signed_urls(file_batch):
+    """
+    file_batch: list of dicts with keys: name, path, size
+    Returns: list of SignedUrlResponseV2 items
+    """
     body = {
         "files": [
             {
@@ -193,11 +215,14 @@ def request_signed_urls(file_batch):
             f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
             f"{r.status_code} {r.text[:200]}"
         )
+        log(f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
+            f"{r.status_code} {r.text[:200]}")
         time.sleep(RETRY_DELAY_SECS)
     raise RuntimeError("Failed to get signed URLs after retries")
 
 
 def upload_to_gcs(signed_url_obj, raw_bytes):
+    """PUT the bytes to Google Cloud Storage using the signed URL."""
     url = signed_url_obj["url"]
     extra_headers = signed_url_obj.get("headers") or {}
     headers = {"Content-Type": "message/rfc822"}
@@ -232,6 +257,8 @@ def register_upload(drive_object, signed_url_str, size_mb, success, duration):
             f"file_upload_status_v2 attempt {attempt+1} failed: "
             f"{r.status_code} {r.text[:200]}"
         )
+        log(f"file_upload_status_v2 attempt {attempt+1} failed: "
+            f"{r.status_code} {r.text[:200]}")
         time.sleep(RETRY_DELAY_SECS)
     return False
 
@@ -249,6 +276,8 @@ def main():
         f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
         f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
     )
+    log(f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
+        f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
     service = get_gmail_service()
     label_id = ensure_processed_label(service)
     log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
@@ -261,6 +290,7 @@ def main():
 
     successes, failures = 0, 0
     batch = []
+    batch = []   # list of (msg_id, raw_bytes, drive_object, size_mb)
 
     def flush_batch():
         nonlocal successes, failures
@@ -276,6 +306,12 @@ def main():
             for item in batch
         ]
 
+        batch_meta = [
+            {"name": item["drive_object"]["name"],
+             "path": item["drive_object"]["path"],
+             "size": item["size_bytes"]}
+            for item in batch
+        ]
         try:
             signed_responses = request_signed_urls(batch_meta)
         except Exception as e:
@@ -287,6 +323,8 @@ def main():
         for item, signed_resp in zip(batch, signed_responses):
             if signed_resp.get("error") or not signed_resp.get("signed_url"):
                 log(f"  Skip {item['drive_object']['name']}: {signed_resp.get('error')}")
+                log(f"  Skip {item['drive_object']['name']}: "
+                    f"{signed_resp.get('error')}")
                 failures += 1
                 continue
 
@@ -350,6 +388,13 @@ def main():
                 "size_mb": size_mb,
             }
         )
+        batch.append({
+            "msg_id": msg_id,
+            "raw_bytes": raw_bytes,
+            "drive_object": drive_object,
+            "size_bytes": size_bytes,
+            "size_mb": size_mb,
+        })
 
         if len(batch) >= BATCH_SIZE:
             flush_batch()
@@ -366,6 +411,12 @@ def main():
         f"Total candidates: {len(msg_ids)}"
     )
 
+            log(f"Progress: {i}/{len(msg_ids)} "
+                f"(successes: {successes}, failures: {failures})")
+
+    flush_batch()
+    log(f"Done. Successes: {successes}, Failures: {failures}, "
+        f"Total candidates: {len(msg_ids)}")
     if failures > 0:
         sys.exit(1)
 
