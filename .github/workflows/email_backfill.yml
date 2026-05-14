@@ -5,10 +5,14 @@ on:
     inputs:
       start_date:
         description: "Start date (YYYY/MM/DD)"
-        required: true
+        required: false
       end_date:
         description: "End date (YYYY/MM/DD)"
-        required: true
+        required: false
+      months_back:
+        description: "Months to process when start/end are not provided"
+        required: false
+        default: "12"
       max_emails:
         description: "Max emails to process (default 5000)"
         required: false
@@ -17,10 +21,13 @@ on:
         description: "AI Drive destination folder"
         required: false
         default: "04 - EMAIL ARCHIVE"
+  schedule:
+    - cron: "17 2 * * *"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
       contents: read
 
@@ -36,14 +43,61 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run email backfill
+      - name: Run email backfill ranges
         env:
           AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
-          AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
-          START_DATE: ${{ github.event.inputs.start_date }}
-          END_DATE: ${{ github.event.inputs.end_date }}
-          MAX_EMAILS: ${{ github.event.inputs.max_emails }}
-        run: python email_backfill.py
+          START_DATE_INPUT: ${{ inputs.start_date }}
+          END_DATE_INPUT: ${{ inputs.end_date }}
+          MONTHS_BACK_INPUT: ${{ inputs.months_back }}
+          MAX_EMAILS_INPUT: ${{ inputs.max_emails }}
+          AIDRIVE_FOLDER_INPUT: ${{ inputs.aidrive_folder }}
+        run: |
+          set -euo pipefail
+
+          MAX_EMAILS="${MAX_EMAILS_INPUT:-5000}"
+          AIDRIVE_FOLDER="${AIDRIVE_FOLDER_INPUT:-04 - EMAIL ARCHIVE}"
+          MONTHS_BACK="${MONTHS_BACK_INPUT:-12}"
+          RANGES_FILE="/tmp/backfill-ranges.txt"
+
+          if [[ -n "${START_DATE_INPUT:-}" || -n "${END_DATE_INPUT:-}" ]]; then
+            if [[ -z "${START_DATE_INPUT:-}" || -z "${END_DATE_INPUT:-}" ]]; then
+              echo "Both start_date and end_date must be provided together."
+              exit 1
+            fi
+            python .github/scripts/generate_backfill_ranges.py \
+              --start-date "${START_DATE_INPUT}" \
+              --end-date "${END_DATE_INPUT}" > "${RANGES_FILE}"
+          else
+            python .github/scripts/generate_backfill_ranges.py \
+              --months-back "${MONTHS_BACK}" > "${RANGES_FILE}"
+          fi
+
+          echo "Backfill ranges to process:"
+          cat "${RANGES_FILE}"
+
+          failed=0
+          while IFS='|' read -r label start_date end_date; do
+            echo "::group::${label} (${start_date} -> ${end_date})"
+            echo "Running ${label} with START_DATE=${start_date} END_DATE=${end_date}"
+
+            if START_DATE="${start_date}" \
+              END_DATE="${end_date}" \
+              MAX_EMAILS="${MAX_EMAILS}" \
+              AIDRIVE_FOLDER="${AIDRIVE_FOLDER}" \
+              python email_backfill.py; then
+              echo "${label} completed successfully."
+            else
+              echo "::warning::${label} failed, continuing to next range."
+              failed=1
+            fi
+
+            echo "::endgroup::"
+          done < "${RANGES_FILE}"
+
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "One or more ranges failed. See grouped logs above."
+            exit 1
+          fi

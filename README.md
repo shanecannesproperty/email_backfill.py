@@ -14,7 +14,7 @@ label from the search query, so you can rerun the same date range safely.
 | --- | --- |
 | `email_backfill.py` | Main backfill job (Gmail → AI Drive). |
 | `get_gmail_token.py` | One-time local helper to mint a Gmail OAuth refresh token. |
-| `.github/workflows/email_backfill.yml` | Manual `workflow_dispatch` workflow that runs the backfill. |
+| `.github/workflows/email_backfill.yml` | Scheduled + manual workflow that runs the backfill in safe date chunks. |
 | `requirements.txt` | Pinned Python dependencies. |
 
 > Only the workflow under `.github/workflows/` is loaded by GitHub Actions.
@@ -53,18 +53,28 @@ Add the following under **Settings → Secrets and variables → Actions**:
 
 ## Running the backfill
 
-Open the **Actions** tab → **Email Backfill** → **Run workflow** and supply:
+Open the **Actions** tab → **Email Backfill** → **Run workflow**.
+
+If you click **Run workflow** with defaults, the job immediately processes the
+**rolling last 12 months** in month-sized ranges, one range at a time.
+
+You can also provide inputs:
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `start_date` | yes | — | Inclusive lower bound. Format `YYYY/MM/DD` (Gmail-search syntax). |
-| `end_date` | yes | — | Exclusive upper bound. Format `YYYY/MM/DD`. |
+| `start_date` | no | — | Optional manual override. Must be supplied with `end_date`. Format `YYYY/MM/DD` (Gmail-search syntax). |
+| `end_date` | no | — | Optional manual override. Must be supplied with `start_date`. Format `YYYY/MM/DD` (exclusive upper bound). |
+| `months_back` | no | `12` | Used only when `start_date`/`end_date` are omitted. |
 | `max_emails` | no | `5000` | Hard cap on messages processed per run. |
 | `aidrive_folder` | no | `04 - EMAIL ARCHIVE` | Top-level AI Drive folder. Files land in `<folder>/YYYY-MM/`. |
 
-For a full 12-month backfill, run the workflow once per month (or any
-chunk size you prefer) — reruns of the same range are safe because already
-processed messages are skipped via the `aidrive-archived` label.
+The workflow also runs on a daily schedule and uses the same rolling-window
+logic. Each run prints every generated range in logs, then logs each range as a
+separate grouped section so you can see exactly what was processed and whether
+the workflow continued after any failed range.
+
+Reruns of the same range are safe because already processed messages are skipped
+via the `aidrive-archived` label.
 
 ## How it works
 
