@@ -38,6 +38,13 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+PROCESSED_LABEL = "aidrive-archived"
+BATCH_SIZE = 25
+MAX_RETRIES = 3
+RETRY_DELAY_SECS = 5
+
 # === Config ===
 AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
@@ -138,6 +145,8 @@ def fetch_raw_email(service, msg_id):
     ).execute()
     raw_bytes = base64.urlsafe_b64decode(msg["raw"])
 
+    headers_parts = raw_bytes.split(b"\r\n\r\n", 1)
+    headers_text = headers_parts[0].decode("utf-8", errors="ignore") if headers_parts else ""
     # Parse minimal headers from the raw bytes for naming
     headers_text = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="ignore")
     headers = {}
@@ -149,6 +158,8 @@ def fetch_raw_email(service, msg_id):
     parsed_date = parse_date_safe(headers.get("date", ""))
     subject_safe = sanitize_for_filename(headers.get("subject", ""))
     from_raw = headers.get("from", "")
+    from_name = from_raw.split("<")[0].strip() or from_raw.strip() or "unknown-sender"
+    from_safe = sanitize_for_filename(from_name, 40)
     from_safe = sanitize_for_filename(from_raw.split("<")[0].strip() or from_raw, 40)
     return raw_bytes, parsed_date, subject_safe, from_safe
 
@@ -200,6 +211,10 @@ def request_signed_urls(file_batch):
         )
         if r.status_code == 200:
             return r.json()
+        log(
+            f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
+            f"{r.status_code} {r.text[:200]}"
+        )
         log(f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
             f"{r.status_code} {r.text[:200]}")
         time.sleep(RETRY_DELAY_SECS)
@@ -238,6 +253,10 @@ def register_upload(drive_object, signed_url_str, size_mb, success, duration):
         )
         if r.status_code == 200:
             return True
+        log(
+            f"file_upload_status_v2 attempt {attempt+1} failed: "
+            f"{r.status_code} {r.text[:200]}"
+        )
         log(f"file_upload_status_v2 attempt {attempt+1} failed: "
             f"{r.status_code} {r.text[:200]}")
         time.sleep(RETRY_DELAY_SECS)
@@ -253,6 +272,10 @@ def label_message_processed(service, msg_id, label_id):
 
 
 def main():
+    log(
+        f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
+        f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
+    )
     log(f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
         f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
     service = get_gmail_service()
@@ -266,12 +289,23 @@ def main():
     log(f"Found {len(msg_ids)} candidate emails")
 
     successes, failures = 0, 0
+    batch = []
     batch = []   # list of (msg_id, raw_bytes, drive_object, size_mb)
 
     def flush_batch():
         nonlocal successes, failures
         if not batch:
             return
+
+        batch_meta = [
+            {
+                "name": item["drive_object"]["name"],
+                "path": item["drive_object"]["path"],
+                "size": item["size_bytes"],
+            }
+            for item in batch
+        ]
+
         batch_meta = [
             {"name": item["drive_object"]["name"],
              "path": item["drive_object"]["path"],
@@ -288,6 +322,7 @@ def main():
 
         for item, signed_resp in zip(batch, signed_responses):
             if signed_resp.get("error") or not signed_resp.get("signed_url"):
+                log(f"  Skip {item['drive_object']['name']}: {signed_resp.get('error')}")
                 log(f"  Skip {item['drive_object']['name']}: "
                     f"{signed_resp.get('error')}")
                 failures += 1
@@ -344,6 +379,15 @@ def main():
             "file_type": "eml",
         }
 
+        batch.append(
+            {
+                "msg_id": msg_id,
+                "raw_bytes": raw_bytes,
+                "drive_object": drive_object,
+                "size_bytes": size_bytes,
+                "size_mb": size_mb,
+            }
+        )
         batch.append({
             "msg_id": msg_id,
             "raw_bytes": raw_bytes,
@@ -356,6 +400,17 @@ def main():
             flush_batch()
 
         if i % 100 == 0:
+            log(
+                f"Progress: {i}/{len(msg_ids)} "
+                f"(successes: {successes}, failures: {failures})"
+            )
+
+    flush_batch()
+    log(
+        f"Done. Successes: {successes}, Failures: {failures}, "
+        f"Total candidates: {len(msg_ids)}"
+    )
+
             log(f"Progress: {i}/{len(msg_ids)} "
                 f"(successes: {successes}, failures: {failures})")
 
