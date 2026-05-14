@@ -24,26 +24,17 @@ USAGE:
 """
 
 import base64
-import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
 import requests
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-
-AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-PROCESSED_LABEL = "aidrive-archived"
-BATCH_SIZE = 25
-MAX_RETRIES = 3
-RETRY_DELAY_SECS = 5
 
 # === Config ===
 AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
@@ -52,6 +43,8 @@ PROCESSED_LABEL = "aidrive-archived"
 BATCH_SIZE = 25                # emails per signed-url batch
 MAX_RETRIES = 3
 RETRY_DELAY_SECS = 5
+REQUEST_TIMEOUT_SECS = 60
+UPLOAD_TIMEOUT_SECS = 120
 
 # === Environment ===
 AIDRIVE_API_KEY = os.environ["AIDRIVE_API_KEY"]
@@ -145,8 +138,6 @@ def fetch_raw_email(service, msg_id):
     ).execute()
     raw_bytes = base64.urlsafe_b64decode(msg["raw"])
 
-    headers_parts = raw_bytes.split(b"\r\n\r\n", 1)
-    headers_text = headers_parts[0].decode("utf-8", errors="ignore") if headers_parts else ""
     # Parse minimal headers from the raw bytes for naming
     headers_text = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="ignore")
     headers = {}
@@ -160,7 +151,6 @@ def fetch_raw_email(service, msg_id):
     from_raw = headers.get("from", "")
     from_name = from_raw.split("<")[0].strip() or from_raw.strip() or "unknown-sender"
     from_safe = sanitize_for_filename(from_name, 40)
-    from_safe = sanitize_for_filename(from_raw.split("<")[0].strip() or from_raw, 40)
     return raw_bytes, parsed_date, subject_safe, from_safe
 
 
@@ -183,10 +173,34 @@ def aidrive_headers():
     }
 
 
+def _post_with_retries(url, json_body, label):
+    """POST JSON to ``url`` with retries. Returns parsed JSON on success or
+    raises RuntimeError after exhausting retries. Network/transport exceptions
+    are caught and treated as retryable."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.post(
+                url,
+                headers=aidrive_headers(),
+                json=json_body,
+                timeout=REQUEST_TIMEOUT_SECS,
+            )
+            if r.status_code == 200:
+                return r.json()
+            last_err = f"HTTP {r.status_code} {r.text[:200]}"
+        except requests.RequestException as e:
+            last_err = f"network error: {e}"
+        log(f"{label} attempt {attempt + 1} failed: {last_err}")
+        time.sleep(RETRY_DELAY_SECS)
+    raise RuntimeError(f"{label} failed after {MAX_RETRIES} retries: {last_err}")
+
+
 def request_signed_urls(file_batch):
     """
     file_batch: list of dicts with keys: name, path, size
-    Returns: list of SignedUrlResponseV2 items
+    Returns: list of SignedUrlResponseV2 items (one-to-one with file_batch).
+    Raises RuntimeError if the API does not return one response per request.
     """
     body = {
         "files": [
@@ -202,23 +216,28 @@ def request_signed_urls(file_batch):
             for f in file_batch
         ]
     }
-    for attempt in range(MAX_RETRIES):
-        r = requests.post(
-            f"{AIDRIVE_BASE}/signed_url_upload_batch_v2",
-            headers=aidrive_headers(),
-            json=body,
-            timeout=60,
+    resp = _post_with_retries(
+        f"{AIDRIVE_BASE}/signed_url_upload_batch_v2",
+        body,
+        "signed_url_upload_batch_v2",
+    )
+    # Response shape can be a bare list or wrapped in a key. Normalize.
+    if isinstance(resp, dict):
+        for key in ("files", "results", "items", "signed_urls"):
+            if key in resp and isinstance(resp[key], list):
+                resp = resp[key]
+                break
+    if not isinstance(resp, list):
+        raise RuntimeError(
+            f"signed_url_upload_batch_v2 returned unexpected payload type: "
+            f"{type(resp).__name__}"
         )
-        if r.status_code == 200:
-            return r.json()
-        log(
-            f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
-            f"{r.status_code} {r.text[:200]}"
+    if len(resp) != len(file_batch):
+        raise RuntimeError(
+            f"signed_url_upload_batch_v2 returned {len(resp)} entries for "
+            f"{len(file_batch)} requested files"
         )
-        log(f"signed_url_upload_batch_v2 attempt {attempt+1} failed: "
-            f"{r.status_code} {r.text[:200]}")
-        time.sleep(RETRY_DELAY_SECS)
-    raise RuntimeError("Failed to get signed URLs after retries")
+    return resp
 
 
 def upload_to_gcs(signed_url_obj, raw_bytes):
@@ -227,11 +246,18 @@ def upload_to_gcs(signed_url_obj, raw_bytes):
     extra_headers = signed_url_obj.get("headers") or {}
     headers = {"Content-Type": "message/rfc822"}
     headers.update(extra_headers)
+    last_err = None
     for attempt in range(MAX_RETRIES):
-        r = requests.put(url, data=raw_bytes, headers=headers, timeout=120)
-        if r.status_code in (200, 201):
-            return True
-        log(f"GCS PUT attempt {attempt+1} failed: {r.status_code} {r.text[:200]}")
+        try:
+            r = requests.put(
+                url, data=raw_bytes, headers=headers, timeout=UPLOAD_TIMEOUT_SECS
+            )
+            if r.status_code in (200, 201):
+                return True
+            last_err = f"HTTP {r.status_code} {r.text[:200]}"
+        except requests.RequestException as e:
+            last_err = f"network error: {e}"
+        log(f"GCS PUT attempt {attempt + 1} failed: {last_err}")
         time.sleep(RETRY_DELAY_SECS)
     return False
 
@@ -244,23 +270,16 @@ def register_upload(drive_object, signed_url_str, size_mb, success, duration):
         "uploadSuccess": success,
         "uploadTimeDurationSecs": duration,
     }
-    for attempt in range(MAX_RETRIES):
-        r = requests.post(
+    try:
+        _post_with_retries(
             f"{AIDRIVE_BASE}/file_upload_status_v2",
-            headers=aidrive_headers(),
-            json=body,
-            timeout=60,
+            body,
+            "file_upload_status_v2",
         )
-        if r.status_code == 200:
-            return True
-        log(
-            f"file_upload_status_v2 attempt {attempt+1} failed: "
-            f"{r.status_code} {r.text[:200]}"
-        )
-        log(f"file_upload_status_v2 attempt {attempt+1} failed: "
-            f"{r.status_code} {r.text[:200]}")
-        time.sleep(RETRY_DELAY_SECS)
-    return False
+        return True
+    except RuntimeError as e:
+        log(f"register_upload failed: {e}")
+        return False
 
 
 def label_message_processed(service, msg_id, label_id):
@@ -276,8 +295,6 @@ def main():
         f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
         f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
     )
-    log(f"Starting backfill. Range: {START_DATE} to {END_DATE}. "
-        f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
     service = get_gmail_service()
     label_id = ensure_processed_label(service)
     log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
@@ -289,8 +306,7 @@ def main():
     log(f"Found {len(msg_ids)} candidate emails")
 
     successes, failures = 0, 0
-    batch = []
-    batch = []   # list of (msg_id, raw_bytes, drive_object, size_mb)
+    batch = []  # list of dicts: msg_id, raw_bytes, drive_object, size_bytes, size_mb
 
     def flush_batch():
         nonlocal successes, failures
@@ -306,12 +322,6 @@ def main():
             for item in batch
         ]
 
-        batch_meta = [
-            {"name": item["drive_object"]["name"],
-             "path": item["drive_object"]["path"],
-             "size": item["size_bytes"]}
-            for item in batch
-        ]
         try:
             signed_responses = request_signed_urls(batch_meta)
         except Exception as e:
@@ -322,9 +332,10 @@ def main():
 
         for item, signed_resp in zip(batch, signed_responses):
             if signed_resp.get("error") or not signed_resp.get("signed_url"):
-                log(f"  Skip {item['drive_object']['name']}: {signed_resp.get('error')}")
-                log(f"  Skip {item['drive_object']['name']}: "
-                    f"{signed_resp.get('error')}")
+                log(
+                    f"  Skip {item['drive_object']['name']}: "
+                    f"{signed_resp.get('error')}"
+                )
                 failures += 1
                 continue
 
@@ -336,6 +347,13 @@ def main():
                 failures += 1
                 continue
 
+            # Upload to GCS succeeded. Label the message immediately so a
+            # rerun does not re-upload it even if registration below fails.
+            try:
+                label_message_processed(service, item["msg_id"], label_id)
+            except Exception as e:
+                log(f"  Warning: could not label {item['msg_id']}: {e}")
+
             registered = register_upload(
                 drive_object=signed_resp["drive_object"],
                 signed_url_str=signed_obj["url"],
@@ -344,13 +362,15 @@ def main():
                 duration=duration,
             )
             if not registered:
+                # The bytes are in GCS and the message is labeled; AI Drive
+                # registration failed. Surface as failure but do not retry
+                # (would create a duplicate upload).
+                log(
+                    f"  Warning: upload OK but registration failed for "
+                    f"{item['drive_object']['name']}"
+                )
                 failures += 1
                 continue
-
-            try:
-                label_message_processed(service, item["msg_id"], label_id)
-            except Exception as e:
-                log(f"  Warning: could not label {item['msg_id']}: {e}")
 
             successes += 1
             log(f"  OK ({successes}): {item['drive_object']['name']}")
@@ -388,13 +408,6 @@ def main():
                 "size_mb": size_mb,
             }
         )
-        batch.append({
-            "msg_id": msg_id,
-            "raw_bytes": raw_bytes,
-            "drive_object": drive_object,
-            "size_bytes": size_bytes,
-            "size_mb": size_mb,
-        })
 
         if len(batch) >= BATCH_SIZE:
             flush_batch()
@@ -410,13 +423,6 @@ def main():
         f"Done. Successes: {successes}, Failures: {failures}, "
         f"Total candidates: {len(msg_ids)}"
     )
-
-            log(f"Progress: {i}/{len(msg_ids)} "
-                f"(successes: {successes}, failures: {failures})")
-
-    flush_batch()
-    log(f"Done. Successes: {successes}, Failures: {failures}, "
-        f"Total candidates: {len(msg_ids)}")
     if failures > 0:
         sys.exit(1)
 

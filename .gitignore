@@ -7,3 +7,9 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# OAuth client secrets downloaded for get_gmail_token.py — must never be committed
+credentials.json
+client_secret*.json
+token.json
+
