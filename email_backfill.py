@@ -5,6 +5,8 @@ Pulls emails from Gmail and uploads each one as a .txt file (raw RFC 822
 bytes) to AI Drive via the AI Drive API (signed-URL upload flow). The
 .txt extension is used because AI Drive's signed_url_upload_batch_v2
 endpoint does not accept .eml.
+Pulls emails from Gmail and uploads each one to AI Drive via the
+signed-URL upload flow.
 
 Designed to run unattended in GitHub Actions, but also runs locally.
 
@@ -12,12 +14,24 @@ Idempotent: applies a Gmail label "aidrive-archived" to each successfully
 uploaded message, so reruns of the same date range skip already-processed
 messages — no duplicates.
 
+UPLOAD FORMAT:
+  AI Drive rejects ``message/rfc822`` (``.eml``) uploads with HTTP 422, so
+  each Gmail message is converted to a UTF-8 plain-text rendering before
+  upload (file_type=".txt"). The text contains the key headers — From, To,
+  Date, Subject, Message-ID — followed by the decoded message body.
+
 ATTACHMENT HANDLING:
   Gmail's "raw" format returns the complete RFC 822 message bytes, which
   includes all MIME parts (body text, HTML alternatives, and every attachment).
   The script uploads those raw bytes as a .txt file, so attachments are
   already embedded inside the payload. No separate attachment handling is
   required.
+  include every MIME part (body text, HTML alternative, and every
+  attachment). Attachments whose extension is in the AI Drive allow-list
+  (.pdf, .csv, .xlsx, .xls, .docx, .doc, .pptx, .ppt, .txt, .md) are
+  queued as separate uploads alongside the rendered email text, so they
+  remain accessible in their native form. Attachments with unsupported
+  extensions (images, archives, etc.) are skipped — they remain in Gmail.
 
 OPERATING MODES (set via RUN_MODE environment variable):
 
@@ -89,6 +103,8 @@ import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
+from email import message_from_bytes
+from email.policy import default as email_default_policy
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -712,12 +728,18 @@ _MAX_FILENAME_BASE_LEN = 120
 # ``signed_url_upload_batch_v2`` enum rejects it (HTTP 422). RFC 822 message
 # bodies are uploaded with a ``.txt`` extension instead (see
 # ``_MIME_TO_EXT`` below). Keep entries lowercase with the leading dot.
+# Extensions AI Drive accepts. ``.eml`` is intentionally NOT in this set:
+# AI Drive rejects ``message/rfc822`` / ``.eml`` uploads with HTTP 422. RFC
+# 822 messages must therefore be serialized to ``.txt`` before upload (see
+# :func:`render_email_as_text`). Keep lowercase, leading dot.
 ALLOWED_EXTENSIONS = frozenset({
     ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc",
     ".pptx", ".ppt", ".txt", ".md",
 })
 
 # MIME → extension hints used when a filename has no usable extension.
+# ``message/rfc822`` maps to ``.txt`` because emails are converted to a
+# readable text rendering before upload (AI Drive does not accept ``.eml``).
 _MIME_TO_EXT = {
     "application/pdf": ".pdf",
     "text/csv": ".csv",
@@ -820,7 +842,177 @@ def validate_drive_object(drive_object):
         return False, f"extension {ext!r} is not in ALLOWED_EXTENSIONS"
     if not drive_object.get("path"):
         return False, "missing path"
+    file_type = drive_object.get("file_type")
+    if file_type is not None:
+        if not isinstance(file_type, str) or not file_type:
+            return False, "file_type must be a non-empty string"
+        if f".{file_type.lower().lstrip('.')}" not in ALLOWED_EXTENSIONS:
+            return False, f"file_type {file_type!r} is not supported by AI Drive"
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Email -> plain text rendering
+# ---------------------------------------------------------------------------
+#
+# AI Drive rejects ``message/rfc822`` (``.eml``) uploads with HTTP 422, so the
+# raw RFC 822 bytes pulled from Gmail must be converted to a supported file
+# type before upload. We render each message as UTF-8 plain text with a small
+# header block (From / To / Date / Subject / Message-ID) followed by the
+# message body so the result is human-readable inside AI Drive.
+
+# Common HTML tags we strip when an email has only an HTML body. We avoid
+# pulling in a full HTML parser to keep the script dependency-free.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_WS_RE = re.compile(r"[ \t]+")
+_HTML_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+def _html_to_text(html):
+    """Best-effort conversion of an HTML email part to plain text."""
+    if not html:
+        return ""
+    # Drop script/style blocks entirely so their contents don't leak through.
+    cleaned = re.sub(
+        r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html
+    )
+    # Replace common block elements with newlines so paragraph structure
+    # survives the tag strip below.
+    cleaned = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", cleaned)
+    cleaned = re.sub(
+        r"(?is)</\s*(p|div|li|tr|h[1-6]|table|blockquote)\s*>", "\n", cleaned
+    )
+    cleaned = _HTML_TAG_RE.sub("", cleaned)
+    # Decode the handful of HTML entities most common in email.
+    try:
+        import html as _html_mod
+
+        cleaned = _html_mod.unescape(cleaned)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    cleaned = _HTML_WS_RE.sub(" ", cleaned)
+    cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines())
+    cleaned = _HTML_BLANK_LINES_RE.sub("\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _decode_part(part):
+    """Return the decoded text payload of an ``email.message`` part."""
+    try:
+        payload = part.get_payload(decode=True)
+    except Exception:
+        return ""
+    if not payload:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except (LookupError, TypeError):
+        return payload.decode("utf-8", errors="replace")
+
+
+def _extract_email_body(msg):
+    """Return the best plain-text body for an ``email.message.Message``."""
+    plain_parts = []
+    html_parts = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            disposition = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disposition:
+                continue
+            ctype = (part.get_content_type() or "").lower()
+            if ctype == "text/plain":
+                plain_parts.append(_decode_part(part))
+            elif ctype == "text/html":
+                html_parts.append(_decode_part(part))
+    else:
+        ctype = (msg.get_content_type() or "").lower()
+        text = _decode_part(msg)
+        if ctype == "text/html":
+            html_parts.append(text)
+        else:
+            plain_parts.append(text)
+
+    body = "\n\n".join(p for p in plain_parts if p).strip()
+    if not body and html_parts:
+        body = "\n\n".join(_html_to_text(p) for p in html_parts if p).strip()
+    return body
+
+
+def render_email_as_text(raw_bytes):
+    """Convert raw RFC 822 bytes to a UTF-8 plain-text rendering.
+
+    The output begins with a small header block preserving the email
+    metadata required by the task spec (From, To, Date, Subject,
+    Message-ID) followed by the decoded message body. Returns
+    ``(text_bytes, parsed_message)`` so callers can reuse the parsed
+    message for attachment extraction without re-parsing.
+    """
+    msg = message_from_bytes(raw_bytes, policy=email_default_policy)
+
+    def _hdr(name):
+        value = msg.get(name)
+        if value is None:
+            return ""
+        # ``email.policy.default`` returns header objects; ``str()`` yields
+        # the unfolded, decoded value.
+        return str(value).strip()
+
+    headers = [
+        ("From", _hdr("From")),
+        ("To", _hdr("To")),
+        ("Cc", _hdr("Cc")),
+        ("Date", _hdr("Date")),
+        ("Subject", _hdr("Subject")),
+        ("Message-ID", _hdr("Message-ID")),
+    ]
+    header_lines = [f"{name}: {value}" for name, value in headers if value]
+    body = _extract_email_body(msg)
+    rendered = "\n".join(header_lines)
+    if body:
+        rendered = f"{rendered}\n\n{body}\n"
+    else:
+        rendered = f"{rendered}\n\n[No text body]\n"
+    return rendered.encode("utf-8", errors="replace"), msg
+
+
+def extract_supported_attachments(msg):
+    """Yield ``(filename, ext, content_type, payload_bytes)`` for each
+    attachment whose extension is supported by AI Drive.
+
+    Attachments with unsupported extensions (e.g. images, archives) are
+    silently skipped — they can't be uploaded as their native type and we
+    don't want to inflate the email body with their contents.
+    """
+    if not msg.is_multipart():
+        return
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = (part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        if "attachment" not in disposition and not filename:
+            continue
+        if not filename:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if not payload:
+            continue
+        dot = filename.rfind(".")
+        if dot <= 0:
+            continue
+        ext = filename[dot:].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            continue
+        content_type = (
+            part.get_content_type() or "application/octet-stream"
+        ).lower()
+        yield filename, ext, content_type, payload
 
 
 def parse_date_safe(date_header):
@@ -1052,6 +1244,7 @@ def request_signed_urls(file_batch):
                         if str(f["file_type"]).startswith(".")
                         else f".{f['file_type']}"
                     ),
+                    "file_type": f["file_type"],
                 },
                 "size": f["size"],
             }
@@ -1082,7 +1275,7 @@ def request_signed_urls(file_batch):
     return resp
 
 
-def upload_to_gcs(signed_url_obj, raw_bytes):
+def upload_to_gcs(signed_url_obj, raw_bytes, content_type="application/octet-stream"):
     """PUT the bytes to Google Cloud Storage using the signed URL.
 
     Retries only transient failures (HTTP 408/429/5xx, connection resets,
@@ -1094,6 +1287,7 @@ def upload_to_gcs(signed_url_obj, raw_bytes):
     # Default Content-Type matches the file_type the signed URL was minted
     # for (.txt). Any Content-Type the signed-URL response specifies wins.
     headers = {"Content-Type": "text/plain"}
+    headers = {"Content-Type": content_type}
     headers.update(extra_headers)
     last_err = None
     for attempt in range(MAX_RETRIES):
@@ -1323,6 +1517,10 @@ def process_window(service, label_id, start_str, end_str):
     (AI Drive does not accept ``.eml``). The raw bytes still include the
     full message body AND all attachments embedded in the MIME structure —
     no separate attachment handling is needed.
+    Returns (successes, failures, candidates) counts. Each Gmail message is
+    rendered as plain text (``.txt``) before upload because AI Drive rejects
+    ``.eml`` / ``message/rfc822``. Supported attachments (PDF, Office docs,
+    etc.) are queued as separate uploads alongside the text rendering.
     """
     query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}"
     log(f"  Gmail query: {query}")
@@ -1399,7 +1597,11 @@ def process_window(service, label_id, start_str, end_str):
 
             signed_obj = signed_resp["signed_url"]
             t0 = time.time()
-            ok = upload_to_gcs(signed_obj, item["raw_bytes"])
+            ok = upload_to_gcs(
+                signed_obj,
+                item["raw_bytes"],
+                content_type=item.get("content_type", "application/octet-stream"),
+            )
             duration = time.time() - t0
             if not ok:
                 failures += 1
@@ -1452,14 +1654,34 @@ def process_window(service, label_id, start_str, end_str):
         mime_type = "message/rfc822"
         original_filename = (
             f"{subject_raw}.txt" if subject_raw else f"{msg_id[:8]}.txt"
+        # AI Drive does not accept ``message/rfc822`` (``.eml``) — it returns
+        # HTTP 422. Render the email as a UTF-8 text document containing the
+        # key headers (From / To / Date / Subject / Message-ID) followed by
+        # the message body, and upload that as ``.txt`` instead. Supported
+        # attachments (PDF, Office docs, etc.) are queued as separate uploads
+        # so they remain accessible in their native form.
+        original_mime = "message/rfc822"
+        original_ext = ".eml"
+        try:
+            text_bytes, parsed_msg = render_email_as_text(raw_bytes)
+        except Exception as e:
+            log(f"  Error rendering {msg_id} as text: {e}")
+            failures += 1
+            continue
+
+        normalized_ext = normalize_extension(None, mime_type=original_mime)
+        upload_mime = "text/plain; charset=utf-8"
+        original_filename = (
+            f"{subject_raw}{original_ext}" if subject_raw
+            else f"{msg_id[:8]}{original_ext}"
         )
         filename = build_filename(
-            parsed_date, subject_safe, from_safe, msg_id, mime_type=mime_type
+            parsed_date, subject_safe, from_safe, msg_id, mime_type=original_mime
         )
         folder_path = build_folder_path(parsed_date)
-        size_bytes = len(raw_bytes)
+        size_bytes = len(text_bytes)
         size_mb = size_bytes / (1024 * 1024)
-        final_ext = normalize_extension(filename, mime_type=mime_type)
+        final_ext = normalize_extension(filename, mime_type=original_mime)
 
         drive_object = {
             "name": filename,
@@ -1476,30 +1698,89 @@ def process_window(service, label_id, start_str, end_str):
             skipped += 1
             log(
                 "  Skip msg_id=%s reason=%r original=%r sanitized=%r "
-                "mime=%s ext=%s" % (
+                "orig_ext=%s norm_ext=%s orig_mime=%s file_type=%s" % (
                     msg_id, reason, original_filename, filename,
-                    mime_type, final_ext,
+                    original_ext, normalized_ext, original_mime,
+                    drive_object["file_type"],
                 )
             )
             continue
 
-        if filename != original_filename:
-            log(
-                "  Sanitized msg_id=%s original=%r sanitized=%r "
-                "mime=%s ext=%s" % (
-                    msg_id, original_filename, filename, mime_type, final_ext,
-                )
+        log(
+            "  Prepared msg_id=%s original=%r sanitized=%r "
+            "orig_ext=%s norm_ext=%s orig_mime=%s file_type=%s" % (
+                msg_id, original_filename, filename,
+                original_ext, normalized_ext, original_mime,
+                drive_object["file_type"],
             )
+        )
 
         batch.append(
             {
                 "msg_id": msg_id,
-                "raw_bytes": raw_bytes,
+                "raw_bytes": text_bytes,
                 "drive_object": drive_object,
                 "size_bytes": size_bytes,
                 "size_mb": size_mb,
+                "content_type": upload_mime,
             }
         )
+
+        # Queue any attachments with AI-Drive-supported extensions as
+        # standalone uploads in the same batch. Attachments with unsupported
+        # extensions (images, archives, etc.) are silently skipped — they
+        # remain visible inside Gmail and the rendered text body still
+        # references them through the original headers.
+        attachment_index = 0
+        for att_name, att_ext, att_mime, att_payload in extract_supported_attachments(
+            parsed_msg
+        ):
+            attachment_index += 1
+            att_base = sanitize_filename(
+                att_name[: att_name.rfind(".")] if "." in att_name else att_name,
+                max_len=80,
+            )
+            att_filename = sanitize_filename(
+                f"{parsed_date.strftime('%Y-%m-%d_%H%M')}_"
+                f"{from_safe}_{att_base}_{msg_id[:8]}-att{attachment_index}",
+                max_len=_MAX_FILENAME_BASE_LEN,
+            ) + att_ext
+            att_final_ext = normalize_extension(att_filename, mime_type=att_mime)
+            att_drive_object = {
+                "name": att_filename,
+                "path": folder_path,
+                "isFile": True,
+                "file_type": att_final_ext.lstrip("."),
+            }
+            att_valid, att_reason = validate_drive_object(att_drive_object)
+            if not att_valid:
+                log(
+                    "  Skip attachment msg_id=%s att=%r reason=%r "
+                    "orig_ext=%s norm_ext=%s orig_mime=%s file_type=%s" % (
+                        msg_id, att_name, att_reason,
+                        att_ext, att_final_ext, att_mime,
+                        att_drive_object["file_type"],
+                    )
+                )
+                continue
+            log(
+                "  Prepared attachment msg_id=%s att=%r sanitized=%r "
+                "orig_ext=%s norm_ext=%s orig_mime=%s file_type=%s" % (
+                    msg_id, att_name, att_filename,
+                    att_ext, att_final_ext, att_mime,
+                    att_drive_object["file_type"],
+                )
+            )
+            batch.append(
+                {
+                    "msg_id": msg_id,
+                    "raw_bytes": att_payload,
+                    "drive_object": att_drive_object,
+                    "size_bytes": len(att_payload),
+                    "size_mb": len(att_payload) / (1024 * 1024),
+                    "content_type": att_mime,
+                }
+            )
 
         if len(batch) >= BATCH_SIZE:
             flush_batch()
