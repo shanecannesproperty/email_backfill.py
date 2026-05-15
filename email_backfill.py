@@ -1,8 +1,10 @@
 """
 email_backfill.py
 
-Pulls emails from Gmail and uploads each one as a .eml file to AI Drive
-via the AI Drive API (signed-URL upload flow).
+Pulls emails from Gmail and uploads each one as a .txt file (raw RFC 822
+bytes) to AI Drive via the AI Drive API (signed-URL upload flow). The
+.txt extension is used because AI Drive's signed_url_upload_batch_v2
+endpoint does not accept .eml.
 
 Designed to run unattended in GitHub Actions, but also runs locally.
 
@@ -13,8 +15,9 @@ messages — no duplicates.
 ATTACHMENT HANDLING:
   Gmail's "raw" format returns the complete RFC 822 message bytes, which
   includes all MIME parts (body text, HTML alternatives, and every attachment).
-  When the script uploads this as a .eml file, attachments are already embedded
-  inside the payload. No separate attachment handling is required.
+  The script uploads those raw bytes as a .txt file, so attachments are
+  already embedded inside the payload. No separate attachment handling is
+  required.
 
 OPERATING MODES (set via RUN_MODE environment variable):
 
@@ -705,11 +708,13 @@ _CONTROL_WS_RE = re.compile(r"[\r\n\t\f\v\x00-\x1f]")
 # after the timestamp/sender/msg-id prefix is added.
 _MAX_FILENAME_BASE_LEN = 120
 
-# Extensions AI Drive accepts. ``.eml`` is included because this archiver
-# uploads RFC 822 messages. Keep lowercase, leading dot.
+# Extensions AI Drive accepts. ``.eml`` is NOT in this list — AI Drive's
+# ``signed_url_upload_batch_v2`` enum rejects it (HTTP 422). RFC 822 message
+# bodies are uploaded with a ``.txt`` extension instead (see
+# ``_MIME_TO_EXT`` below). Keep entries lowercase with the leading dot.
 ALLOWED_EXTENSIONS = frozenset({
     ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc",
-    ".pptx", ".ppt", ".txt", ".md", ".eml",
+    ".pptx", ".ppt", ".txt", ".md",
 })
 
 # MIME → extension hints used when a filename has no usable extension.
@@ -724,7 +729,8 @@ _MIME_TO_EXT = {
     "application/vnd.ms-powerpoint": ".ppt",
     "text/plain": ".txt",
     "text/markdown": ".md",
-    "message/rfc822": ".eml",
+    # AI Drive does not accept .eml; archive RFC 822 messages as .txt.
+    "message/rfc822": ".txt",
 }
 
 FALLBACK_EXTENSION = ".txt"
@@ -1027,7 +1033,7 @@ def _post_with_retries(url, json_body, label):
 
 def request_signed_urls(file_batch):
     """
-    file_batch: list of dicts with keys: name, path, size
+    file_batch: list of dicts with keys: name, path, size, file_type
     Returns: list of SignedUrlResponseV2 items (one-to-one with file_batch).
     Raises RuntimeError if the API does not return one response per request.
     """
@@ -1038,7 +1044,14 @@ def request_signed_urls(file_batch):
                     "name": f["name"],
                     "path": f["path"],
                     "isFile": True,
-                    "file_type": "eml",
+                    # AI Drive's enum requires the leading dot
+                    # (e.g. ".pdf", ".txt"). Normalize defensively in case
+                    # an upstream caller passes the bare extension.
+                    "file_type": (
+                        f["file_type"]
+                        if str(f["file_type"]).startswith(".")
+                        else f".{f['file_type']}"
+                    ),
                 },
                 "size": f["size"],
             }
@@ -1078,7 +1091,9 @@ def upload_to_gcs(signed_url_obj, raw_bytes):
     """
     url = signed_url_obj["url"]
     extra_headers = signed_url_obj.get("headers") or {}
-    headers = {"Content-Type": "message/rfc822"}
+    # Default Content-Type matches the file_type the signed URL was minted
+    # for (.txt). Any Content-Type the signed-URL response specifies wins.
+    headers = {"Content-Type": "text/plain"}
     headers.update(extra_headers)
     last_err = None
     for attempt in range(MAX_RETRIES):
@@ -1304,9 +1319,10 @@ def process_window(service, label_id, start_str, end_str):
     """Upload all unlabelled emails in [start_str, end_str) to AI Drive.
 
     Returns (successes, failures, candidates) counts.
-    Emails are fetched as raw RFC 822 bytes (.eml), which include the full
-    message body AND all attachments embedded in the MIME structure — no
-    separate attachment handling is needed.
+    Emails are fetched as raw RFC 822 bytes and uploaded as ``.txt`` files
+    (AI Drive does not accept ``.eml``). The raw bytes still include the
+    full message body AND all attachments embedded in the MIME structure —
+    no separate attachment handling is needed.
     """
     query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}"
     log(f"  Gmail query: {query}")
@@ -1347,6 +1363,7 @@ def process_window(service, label_id, start_str, end_str):
                 "name": item["drive_object"]["name"],
                 "path": item["drive_object"]["path"],
                 "size": item["size_bytes"],
+                "file_type": item["drive_object"]["file_type"],
             }
             for item in batch
         ]
@@ -1428,11 +1445,13 @@ def process_window(service, label_id, start_str, end_str):
             failures += 1
             continue
 
-        # Emails are uploaded as RFC 822 .eml; record the MIME type for logs
-        # and so normalize_extension() has a sensible fallback.
+        # Emails are uploaded as RFC 822 bodies but AI Drive does not accept
+        # ``.eml``; archive them as ``.txt`` instead. ``mime_type`` is still
+        # recorded for logs and so ``normalize_extension`` has a sensible
+        # fallback (``message/rfc822`` → ``.txt`` via ``_MIME_TO_EXT``).
         mime_type = "message/rfc822"
         original_filename = (
-            f"{subject_raw}.eml" if subject_raw else f"{msg_id[:8]}.eml"
+            f"{subject_raw}.txt" if subject_raw else f"{msg_id[:8]}.txt"
         )
         filename = build_filename(
             parsed_date, subject_safe, from_safe, msg_id, mime_type=mime_type
