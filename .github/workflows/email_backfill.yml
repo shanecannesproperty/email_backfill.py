@@ -52,6 +52,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Persist the historical-mode checkpoint between runs so each
+      # successive run advances further backwards instead of restarting
+      # the same months. The runner filesystem is wiped at job end, so
+      # without this cache `.backfill_checkpoint.json` would never survive.
+      # The rolling key (run_id) plus restore-keys means every run saves a
+      # new cache entry while restoring the most recent prior one.
+      - name: Restore backfill checkpoint
+        id: checkpoint-cache
+        uses: actions/cache@v4
+        with:
+          path: .backfill_checkpoint.json
+          key: backfill-checkpoint-${{ github.run_id }}
+          restore-keys: |
+            backfill-checkpoint-
+
       - name: Run email backfill
         env:
           # Preferred: Firebase auto-refresh credentials. When both are set
