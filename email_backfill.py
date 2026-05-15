@@ -75,11 +75,21 @@ REQUEST_TIMEOUT_SECS = 60
 UPLOAD_TIMEOUT_SECS = 120
 
 # === Environment ===
-AIDRIVE_API_KEY = os.environ["AIDRIVE_API_KEY"]
+def _require_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            "Check your GitHub Actions secrets configuration."
+        )
+    return value
+
+
+AIDRIVE_API_KEY = _require_env("AIDRIVE_API_KEY")
 AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
-GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
-GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
-GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
+GMAIL_CLIENT_ID = _require_env("GMAIL_CLIENT_ID")
+GMAIL_CLIENT_SECRET = _require_env("GMAIL_CLIENT_SECRET")
+GMAIL_REFRESH_TOKEN = _require_env("GMAIL_REFRESH_TOKEN")
 # RUN_MODE: "historical" | "incremental" | "" (empty = custom, requires START/END)
 RUN_MODE = os.environ.get("RUN_MODE", "").strip().lower()
 START_DATE = os.environ.get("START_DATE", "")
