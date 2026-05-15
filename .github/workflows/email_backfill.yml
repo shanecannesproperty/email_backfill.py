@@ -57,7 +57,7 @@ jobs:
           AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
           AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
-          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           # Scheduled runs always use incremental mode.
           # Manual runs use the chosen run_mode (default: historical).
