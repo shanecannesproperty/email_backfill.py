@@ -13,3 +13,7 @@ credentials.json
 client_secret*.json
 token.json
 
+# Resumable historical-backfill checkpoint (local progress; never commit)
+.backfill_checkpoint.json
+*.checkpoint.json
+

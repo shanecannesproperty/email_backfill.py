@@ -43,14 +43,22 @@ success it prints `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
 
 ### 3. Configure GitHub repository secrets
 
-Add the following under **Settings → Secrets and variables → Actions**:
+Add the following under **Settings → Secrets and variables → Actions**.
+**Preferred** is the Firebase auto-refresh pair, which lets long-running
+backfills mint fresh AI Drive JWTs on demand and never stop for a
+manually-pasted token:
 
-| Secret | Description |
-| --- | --- |
-| `AIDRIVE_TOKEN` | Bearer JWT for your AI Drive account (copy from your AI Drive browser session). |
-| `GMAIL_CLIENT_ID` | OAuth client id from step 2. |
-| `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth client secret from step 2. |
-| `GMAIL_REFRESH_TOKEN` | Refresh token from step 2. |
+| Secret | Required | Description |
+| --- | --- | --- |
+| `AIDRIVE_REFRESH_TOKEN` | preferred | Firebase refresh token from `stsTokenManager.refreshToken` (see [Firebase auto-refresh](#ai-drive-jwt-expiration--firebase-auto-refresh)). Long-lived. |
+| `AIDRIVE_FIREBASE_API_KEY` | preferred | Firebase Web API key (`apiKey` field, e.g. `AIzaSy…`) from the same browser localStorage entry. |
+| `AIDRIVE_TOKEN` | fallback | Short-lived bearer JWT pasted from the AI Drive browser session. Only needed when the two values above are not set. |
+| `GMAIL_CLIENT_ID` | yes | OAuth client id from step 2. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | yes | OAuth client secret from step 2. |
+| `GMAIL_REFRESH_TOKEN` | yes | Refresh token from step 2. |
+
+> **Never commit any of these values.** `.env`, token files, and the
+> historical-mode checkpoint file are all listed in `.gitignore`.
 
 ## Operating modes
 
@@ -126,8 +134,15 @@ No separate handling is needed.
 
 ### Failure handling and reruns
 
-* All AI Drive API calls and GCS PUTs are retried up to 3 times with a
-  5-second backoff. Network errors are treated as retryable.
+* **Retry classification** — Only transient failures are retried (HTTP 408 /
+  429 / 5xx, connection resets, read/connect timeouts). Permanent failures
+  fail fast and are never retried:
+  - HTTP 401 / `AUTH_REQUIRED` / "invalid token" → treated as expired JWT,
+    see [AI Drive JWT expiration](#ai-drive-jwt-expiration--refresh) below.
+  - Other 4xx (validation errors, invalid payload, unsupported file type) →
+    the offending record is skipped and counted as a failure; retrying would
+    just produce the same error.
+* All retried calls back off 5 seconds between attempts (up to 3 attempts).
 * If `signed_url_upload_batch_v2` returns a different number of entries than
   requested, the entire batch is failed (no silent drops).
 * If a GCS upload succeeds but registration fails, the message is still
@@ -135,7 +150,99 @@ No separate handling is needed.
   the bytes**; instead you should investigate the registration failure
   in the run log and re-register manually if needed.
 * The job exits with a non-zero status if any failures occurred so the
-  workflow run is marked red.
+  workflow run is marked red. **Exit code 2 is reserved** for clean
+  termination after an expired JWT — see below.
+
+## AI Drive JWT expiration & Firebase auto-refresh
+
+AI Drive sits behind Firebase Authentication. The token used in
+`Authorization: Bearer <JWT>` is a short-lived ID token (≈1 hour TTL) that
+is normally minted in the browser by Firebase's secure-token endpoint. To
+avoid stopping a long-running historical backfill every hour for a
+manually-pasted token, the uploader can run that same refresh flow itself.
+
+### How it works
+
+1. Read `AIDRIVE_REFRESH_TOKEN` and `AIDRIVE_FIREBASE_API_KEY` from the
+   environment (typically GitHub Actions secrets).
+2. Before every AI Drive request, check the cached JWT's expiry. If it is
+   missing or within ~2 minutes of expiring, POST to
+   `https://securetoken.googleapis.com/v1/token?key=<API_KEY>` with
+   `grant_type=refresh_token` and `refresh_token=<REFRESH_TOKEN>`.
+3. Use the returned `id_token` as the new `Authorization: Bearer …`. The
+   `expires_in` field (and the JWT's `exp` claim) drives the next refresh.
+4. If AI Drive ever still responds with `HTTP 401` / `AUTH_REQUIRED` /
+   "invalid token", trigger an immediate refresh and **retry the failing
+   request once** before giving up.
+
+The refresh token is long-lived and is never written to disk by the
+uploader; the minted JWT is held in memory only and is never logged in
+full (logs include only `event=firebase_refresh status=ok user_id=… ttl_secs=…`
+plus a length-only redaction of the new token).
+
+### Where to find the values (one-time, in the browser)
+
+1. Open <https://myaidrive.com> in a browser and sign in.
+2. Open **DevTools → Application → Local Storage → `https://myaidrive.com`**.
+3. Find the entry whose key starts with `firebase:authUser:` and ends with
+   `:[DEFAULT]` — the middle segment is the Firebase Web API key.
+4. Read the JSON value:
+   - `apiKey` → set as `AIDRIVE_FIREBASE_API_KEY`
+   - `stsTokenManager.refreshToken` → set as `AIDRIVE_REFRESH_TOKEN`
+
+That's it. After both values are saved as GitHub Actions secrets (or
+written to `.env` for local runs), the uploader keeps itself authenticated
+indefinitely without any further intervention.
+
+### Fallback: manually-pasted token
+
+If the Firebase secrets are not configured the uploader falls back to the
+old behaviour: it reads `AIDRIVE_TOKEN` (or `AIDRIVE_TOKEN_FILE`) and
+treats it as the bearer JWT until it expires. When AI Drive responds with
+`HTTP 401` / `AUTH_REQUIRED` and no Firebase refresh is possible, the
+script logs `AI Drive JWT expired — refresh required`, preserves the
+historical checkpoint, and exits with **code 2** so you can paste a new
+token and re-run.
+
+To grab a fallback token: in the same DevTools view, copy
+`stsTokenManager.accessToken` (or read it from `Authorization: Bearer …`
+on any request to `ai-drive-api-prod-…run.app` under DevTools → Network).
+
+### Replacing credentials
+
+* **Refresh token rotated / revoked** — re-extract `AIDRIVE_REFRESH_TOKEN`
+  from `firebase:authUser:…:[DEFAULT]` → `stsTokenManager.refreshToken`
+  and update the GitHub Actions secret (or `.env`).
+* **Manual fallback token expired** — paste a new value into `AIDRIVE_TOKEN`
+  (Actions secret or `.env`), or write it to the file pointed to by
+  `AIDRIVE_TOKEN_FILE` for hot-swap mid-run. Strongly consider switching
+  to the Firebase auto-refresh flow above to avoid this entirely.
+
+> ⚠️ **Never commit `.env`, `AIDRIVE_REFRESH_TOKEN`, `AIDRIVE_TOKEN`,
+> any token file, or the checkpoint file.** `.env`, `*.checkpoint.json`,
+> and `.backfill_checkpoint.json` are already listed in `.gitignore`. Any
+> path you choose for `AIDRIVE_TOKEN_FILE` must also live outside the
+> repository (e.g. under `/run/secrets/`).
+
+## Resumable historical imports
+
+Historical backfills can take a long time and can be interrupted by an
+expired JWT, a network outage, GitHub Actions cancellation, or a manual
+stop. The script writes a small JSON checkpoint file after every monthly
+chunk that completes successfully, and **skips already-completed chunks
+on the next run**:
+
+* Default path: `.backfill_checkpoint.json` in the working directory.
+* Override with the `CHECKPOINT_FILE` environment variable.
+* The file contains only the list of completed `(start, end)` chunk keys
+  plus a saved-at timestamp — no message data, no credentials.
+* Writes are atomic (temp file + rename + `fsync`) so a crash mid-write
+  cannot corrupt the file. A corrupt or unreadable checkpoint is ignored
+  and treated as an empty resume state.
+* The checkpoint is gitignored — never commit it.
+
+To start a historical backfill from scratch, simply delete the checkpoint
+file before triggering the run.
 
 ### Required configuration assumptions
 
@@ -160,8 +267,9 @@ For local runs, the recommended workflow is to use a `.env` file:
 
 ```bash
 cp .env.example .env
-# Edit .env and paste your AI Drive Bearer JWT into AIDRIVE_TOKEN,
-# plus your Gmail OAuth values from `get_gmail_token.py`.
+# Edit .env: paste AIDRIVE_REFRESH_TOKEN + AIDRIVE_FIREBASE_API_KEY
+# (preferred — auto-refresh) or, as a fallback, AIDRIVE_TOKEN.
+# Plus your Gmail OAuth values from `get_gmail_token.py`.
 pip install -r requirements.txt
 
 # Export the variables into your shell, then run:
@@ -169,18 +277,28 @@ set -a; . ./.env; set +a
 python email_backfill.py
 ```
 
-> **⚠️ Warning:** `AIDRIVE_TOKEN` is a Bearer JWT copied from your AI Drive
-> browser session. It **may expire** — if AI Drive API calls start failing
-> with HTTP 401/403, refresh the token from the browser and update
-> `.env` (locally) or the `AIDRIVE_TOKEN` GitHub Actions secret.
-> **Never commit `.env` or the raw token** — `.env` is already listed in
-> `.gitignore`.
+> **⚠️ Warning:** AI Drive bearer JWTs are short-lived (~1 hour). When
+> `AIDRIVE_REFRESH_TOKEN` and `AIDRIVE_FIREBASE_API_KEY` are configured,
+> the uploader mints fresh JWTs automatically via Firebase's secure-token
+> endpoint and a long historical run keeps going indefinitely. When only
+> the manual `AIDRIVE_TOKEN` fallback is configured and AI Drive starts
+> returning HTTP 401 / `AUTH_REQUIRED` / "invalid token", the script logs
+> `AI Drive JWT expired — refresh required`, preserves any historical
+> progress in `.backfill_checkpoint.json`, and exits with code 2. See
+> [AI Drive JWT expiration & Firebase auto-refresh](#ai-drive-jwt-expiration--firebase-auto-refresh)
+> for the full refresh procedure.
+> **Never commit `.env`, raw tokens, or the checkpoint file** — they are
+> already listed in `.gitignore`.
 
 Or, if you prefer plain shell exports:
 
 ```bash
 pip install -r requirements.txt
-export AIDRIVE_TOKEN=...
+# Preferred: Firebase auto-refresh (no manual token rotation needed)
+export AIDRIVE_REFRESH_TOKEN=...
+export AIDRIVE_FIREBASE_API_KEY=AIzaSy...
+# Fallback only — set instead of (or in addition to) the two above
+# export AIDRIVE_TOKEN=...
 export GMAIL_CLIENT_ID=...
 export GMAIL_CLIENT_SECRET=...
 export GMAIL_REFRESH_TOKEN=...
@@ -212,8 +330,11 @@ python email_backfill.py
   emails can take tens of minutes. GitHub Actions has a 6-hour job limit, which
   is sufficient for typical mailbox sizes; very large mailboxes (100 k+ emails)
   may need to be split into smaller custom date-range runs.
-* **Scheduled runs require secrets** — If any of the four secrets
-  (`AIDRIVE_TOKEN`, `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
-  `GMAIL_REFRESH_TOKEN`) are missing or expired, scheduled runs will fail and
-  show as red in the Actions tab. Renew the refresh token via `get_gmail_token.py`
-  if Gmail authentication stops working.
+* **Scheduled runs require secrets** — at minimum the script needs Gmail
+  OAuth (`GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+  `GMAIL_REFRESH_TOKEN`) plus AI Drive auth — either the preferred
+  Firebase pair (`AIDRIVE_REFRESH_TOKEN` + `AIDRIVE_FIREBASE_API_KEY`) or
+  the fallback `AIDRIVE_TOKEN`. If Gmail authentication stops working,
+  renew the refresh token via `get_gmail_token.py`. If AI Drive auth
+  stops working, re-extract the Firebase refresh token from the browser
+  (see [Firebase auto-refresh](#ai-drive-jwt-expiration--firebase-auto-refresh)).

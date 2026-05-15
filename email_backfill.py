@@ -33,7 +33,28 @@ OPERATING MODES (set via RUN_MODE environment variable):
 
 ENVIRONMENT VARIABLES:
 
-  AIDRIVE_TOKEN                your AI Drive API token
+  AIDRIVE_REFRESH_TOKEN        (preferred) Firebase refresh token for the
+                               AI Drive account. Read from the browser
+                               localStorage entry
+                               ``firebase:authUser:<apiKey>:[DEFAULT]`` →
+                               ``stsTokenManager.refreshToken``. When this and
+                               AIDRIVE_FIREBASE_API_KEY are both set, the
+                               uploader mints fresh JWTs automatically and no
+                               longer depends on a manually-pasted
+                               AIDRIVE_TOKEN.
+  AIDRIVE_FIREBASE_API_KEY     (preferred) Firebase Web API key. Read from the
+                               same localStorage entry → ``apiKey``, e.g.
+                               ``AIzaSy...``.
+  AIDRIVE_TOKEN                (optional fallback) AI Drive bearer JWT pasted
+                               from a logged-in browser session. Used only if
+                               the Firebase refresh credentials above are not
+                               set. Short-lived; will be retired automatically
+                               once a Firebase refresh succeeds.
+  AIDRIVE_TOKEN_FILE           (optional fallback) path to a file containing
+                               the AI Drive JWT. When set, the token is
+                               reloaded from this file before every API
+                               request, so a new JWT can be dropped in place
+                               mid-run without restarting.
   AIDRIVE_FOLDER               destination folder, e.g. "04 - EMAIL ARCHIVE"
   GMAIL_CLIENT_ID              OAuth client id from Google Cloud Console
   GMAIL_CLIENT_SECRET          OAuth client secret
@@ -46,15 +67,23 @@ ENVIRONMENT VARIABLES:
                                chunk, so the total across all chunks can be much higher.
                                Default 2000.
   INCREMENTAL_LOOKBACK_DAYS    (optional) days back for incremental, default 2
+  CHECKPOINT_FILE              (optional) path to the historical-mode checkpoint
+                               file. Default ".backfill_checkpoint.json". Chunks
+                               recorded here are skipped on the next run, so a
+                               historical backfill interrupted by an expired
+                               JWT (or any other failure) resumes where it left
+                               off after the token is refreshed.
 
 USAGE:
   python email_backfill.py
 """
 
 import base64
+import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -86,7 +115,26 @@ def _require_env(name):
     return value
 
 
-AIDRIVE_TOKEN = _require_env("AIDRIVE_TOKEN")
+AIDRIVE_TOKEN_FILE = os.environ.get("AIDRIVE_TOKEN_FILE", "").strip()
+# Firebase auto-refresh credentials (preferred). When both are set, the
+# uploader mints fresh AI Drive JWTs on demand via Google Identity Toolkit's
+# secure-token endpoint, so long-running historical backfills never have to
+# stop for a manually-pasted token.
+AIDRIVE_REFRESH_TOKEN = os.environ.get("AIDRIVE_REFRESH_TOKEN", "").strip()
+AIDRIVE_FIREBASE_API_KEY = os.environ.get("AIDRIVE_FIREBASE_API_KEY", "").strip()
+# Optional manual fallback. Only required when Firebase refresh credentials
+# are not configured — otherwise it acts as a last-resort token until the
+# first successful refresh.
+_AIDRIVE_TOKEN_ENV = os.environ.get("AIDRIVE_TOKEN", "").strip()
+if not (AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY) \
+        and not _AIDRIVE_TOKEN_ENV \
+        and not AIDRIVE_TOKEN_FILE:
+    raise RuntimeError(
+        "Missing AI Drive credentials: set AIDRIVE_REFRESH_TOKEN + "
+        "AIDRIVE_FIREBASE_API_KEY (preferred, enables auto-refresh) or, "
+        "as a fallback, AIDRIVE_TOKEN / AIDRIVE_TOKEN_FILE. "
+        "Check your GitHub Actions secrets configuration."
+    )
 AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
 GMAIL_CLIENT_ID = _require_env("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = _require_env("GMAIL_CLIENT_SECRET")
@@ -99,11 +147,425 @@ MAX_EMAILS = int(os.environ.get("MAX_EMAILS", "2000"))
 # For incremental mode: how many calendar days back to query (2 days catches
 # all mail that arrived since the previous 30-minute run, even across midnight).
 INCREMENTAL_LOOKBACK_DAYS = int(os.environ.get("INCREMENTAL_LOOKBACK_DAYS", "2"))
+# Checkpoint file: stores completed (start, end) chunks so an interrupted
+# historical backfill can resume from the last successful chunk.
+CHECKPOINT_FILE = os.environ.get(
+    "CHECKPOINT_FILE", ".backfill_checkpoint.json"
+).strip() or ".backfill_checkpoint.json"
 
 
 def log(msg):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{ts}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Permanent vs transient error classification
+# ---------------------------------------------------------------------------
+
+class AIDriveAuthExpired(Exception):
+    """Raised when AI Drive returns 401 / AUTH_REQUIRED / invalid token.
+
+    This is a permanent failure for the current process: retrying the same
+    expired Bearer JWT will keep failing. Callers should preserve checkpoint
+    state and exit cleanly so the operator can refresh the token.
+    """
+
+
+class AIDrivePermanentError(Exception):
+    """Raised for permanent (non-retryable) AI Drive API failures.
+
+    Examples: HTTP 4xx other than 401/408/429 — invalid payload, validation
+    errors, unsupported file types. Retrying would just produce the same
+    error and waste quota.
+    """
+
+
+# Substrings (case-insensitive) in a response body that indicate the JWT is
+# no longer accepted, even when the HTTP status isn't 401.
+_AUTH_EXPIRED_MARKERS = (
+    "auth_required",
+    "invalid token",
+    "invalid_token",
+    "token expired",
+    "token has expired",
+    "expired token",
+    "jwt expired",
+    "unauthorized",
+)
+
+
+def _looks_like_auth_failure(status, body):
+    """Return True if the response signals an expired / invalid JWT."""
+    if status == 401:
+        return True
+    if not body:
+        return False
+    lower = body.lower()
+    return any(marker in lower for marker in _AUTH_EXPIRED_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic AI Drive token loading + Firebase auto-refresh
+# ---------------------------------------------------------------------------
+#
+# Bearer JWTs minted from the AI Drive (Firebase) browser session expire
+# after roughly an hour, which is shorter than a full historical backfill
+# can take. To avoid stopping mid-run for a manually-pasted token we mint
+# fresh JWTs on demand using Firebase's secure-token endpoint:
+#
+#   POST https://securetoken.googleapis.com/v1/token?key=<API_KEY>
+#   form-encoded: grant_type=refresh_token & refresh_token=<REFRESH_TOKEN>
+#
+# The response carries access_token / id_token / expires_in / user_id; we
+# use id_token as the AI Drive ``Authorization: Bearer …`` value and refresh
+# proactively when the cached JWT is within FIREBASE_REFRESH_SKEW_SECS of
+# expiry (or reactively after an AUTH_REQUIRED / 401 response).
+#
+# The ``AIDRIVE_TOKEN`` / ``AIDRIVE_TOKEN_FILE`` mechanisms are kept as a
+# manual fallback for environments that have not (yet) been configured with
+# the Firebase refresh credentials.
+
+FIREBASE_SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+# Refresh slightly before the JWT actually expires so an in-flight request
+# never lands with a token that's about to die.
+FIREBASE_REFRESH_SKEW_SECS = 120
+# Hard cap on consecutive Firebase-refresh attempts before giving up. Stops
+# the process from busy-looping if the refresh token itself is revoked.
+FIREBASE_REFRESH_MAX_ATTEMPTS = 3
+
+# Default TTL assumed when the Firebase response omits expires_in and the
+# minted JWT carries no decodable exp claim. Conservative — Firebase ID
+# tokens are nominally valid for 1 hour; this leaves headroom to refresh.
+FIREBASE_DEFAULT_TTL_SECS = 50 * 60
+# JWT payloads are URL-safe base64 without padding; pad to a multiple of 4
+# before decoding.
+_BASE64_ALIGNMENT = 4
+
+_aidrive_token_cache = {
+    "value": None,        # current bearer JWT (id_token)
+    "source": None,       # "firebase" | "file:…" | "env:AIDRIVE_TOKEN"
+    "expires_at": None,   # epoch seconds, or None if unknown
+}
+
+
+def _read_token_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        log(f"WARN: could not read AIDRIVE_TOKEN_FILE={path!r}: {e}")
+        return ""
+
+
+def _decode_jwt_exp(token):
+    """Return the JWT ``exp`` claim (epoch seconds) or ``None`` on failure.
+
+    Used so manually-pasted tokens (without an explicit expires_in from the
+    refresh endpoint) can still participate in proactive expiry detection.
+    Decoding is best-effort and never validates the signature — we just need
+    the unsigned ``exp`` claim for scheduling.
+    """
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        payload_b64 = token.split(".")[1]
+        padding = "=" * (-len(payload_b64) % _BASE64_ALIGNMENT)
+        raw = base64.urlsafe_b64decode(payload_b64 + padding)
+        claims = json.loads(raw.decode("utf-8", errors="ignore"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    exp = claims.get("exp")
+    return int(exp) if isinstance(exp, (int, float)) else None
+
+
+def is_token_expired(expires_at=None, skew=FIREBASE_REFRESH_SKEW_SECS):
+    """Return True when the cached token has expired (or will, within skew).
+
+    Treats an unknown ``expires_at`` as "expired" so the caller refreshes —
+    this is the safe default when we have no idea how long a manually pasted
+    token has left.
+    """
+    if expires_at is None:
+        return True
+    return time.time() + skew >= expires_at
+
+
+def _redact(value, keep=4):
+    """Return a short, non-sensitive marker for secret values.
+
+    Never returns enough characters to reconstruct the secret. Used only in
+    structured log lines so operators can correlate refresh events without
+    leaking the JWT itself.
+    """
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return "<redacted>"
+    return f"<redacted len={len(value)}>"
+
+
+def refresh_firebase_token():
+    """Mint a fresh AI Drive JWT via Firebase's secure-token endpoint.
+
+    Updates the in-memory token cache on success and returns the new
+    ``id_token``. Raises :class:`AIDriveAuthExpired` if the refresh token
+    is rejected (HTTP 400 ``INVALID_REFRESH_TOKEN`` /
+    ``TOKEN_EXPIRED`` / ``USER_DISABLED`` etc.) so the caller can stop
+    cleanly. Network / 5xx errors raise ``RuntimeError`` so the surrounding
+    retry classifier can treat them as transient.
+    """
+    if not (AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY):
+        raise AIDriveAuthExpired(
+            "Firebase refresh credentials are not configured "
+            "(set AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY)."
+        )
+    last_err = None
+    for attempt in range(FIREBASE_REFRESH_MAX_ATTEMPTS):
+        try:
+            r = requests.post(
+                FIREBASE_SECURE_TOKEN_URL,
+                params={"key": AIDRIVE_FIREBASE_API_KEY},
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": AIDRIVE_REFRESH_TOKEN,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                timeout=REQUEST_TIMEOUT_SECS,
+            )
+        except _TRANSIENT_NETWORK_EXCEPTIONS as e:
+            last_err = f"network error: {type(e).__name__}: {e}"
+            log(
+                "event=firebase_refresh attempt=%d classification=transient "
+                "reason=network_error" % (attempt + 1)
+            )
+            time.sleep(RETRY_DELAY_SECS)
+            continue
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Firebase refresh transport error: {type(e).__name__}: {e}"
+            ) from e
+
+        if r.status_code == 200:
+            try:
+                payload = r.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Firebase refresh returned non-JSON body: {e}"
+                ) from e
+            id_token = (payload.get("id_token") or "").strip()
+            access_token = (payload.get("access_token") or "").strip()
+            user_id = payload.get("user_id") or ""
+            try:
+                expires_in = int(payload.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                expires_in = 0
+            # Prefer id_token (Firebase ID JWT) for AI Drive's
+            # ``Authorization: Bearer …`` header. Fall back to access_token
+            # if the response shape ever differs; both are JWTs minted by
+            # the same secure-token service.
+            new_token = id_token or access_token
+            if not new_token:
+                raise AIDriveAuthExpired(
+                    "Firebase refresh succeeded but returned no id_token / "
+                    "access_token — check AIDRIVE_FIREBASE_API_KEY."
+                )
+            jwt_exp = _decode_jwt_exp(new_token)
+            now = time.time()
+            if expires_in > 0:
+                expires_at = now + expires_in
+            elif jwt_exp:
+                expires_at = float(jwt_exp)
+            else:
+                # Conservative default when neither expires_in nor an
+                # exp claim is available — still refresh proactively.
+                expires_at = now + FIREBASE_DEFAULT_TTL_SECS
+            old = _aidrive_token_cache.get("value")
+            _aidrive_token_cache.update(
+                {
+                    "value": new_token,
+                    "source": "firebase",
+                    "expires_at": expires_at,
+                }
+            )
+            ttl = max(0, int(expires_at - now))
+            log(
+                "event=firebase_refresh status=ok user_id=%s ttl_secs=%d "
+                "rotated=%s token=%s"
+                % (
+                    user_id or "<unknown>",
+                    ttl,
+                    "true" if old and old != new_token else "false",
+                    _redact(new_token),
+                )
+            )
+            return new_token
+
+        # Non-200 — classify.
+        body = r.text or ""
+        last_err = f"HTTP {r.status_code} {body[:200]}"
+        body_lower = body.lower()
+        permanent_markers = (
+            "invalid_refresh_token",
+            "token_expired",
+            "user_disabled",
+            "user_not_found",
+            "invalid_grant",
+        )
+        is_permanent = (
+            r.status_code in (400, 401, 403)
+            and any(m in body_lower for m in permanent_markers)
+        )
+        if is_permanent:
+            log(
+                f"event=firebase_refresh status=rejected "
+                f"http={r.status_code} reason=permanent"
+            )
+            raise AIDriveAuthExpired(
+                f"Firebase refresh token rejected ({last_err}). "
+                "Re-extract AIDRIVE_REFRESH_TOKEN from the browser "
+                "(localStorage → firebase:authUser:<apiKey>:[DEFAULT] → "
+                "stsTokenManager.refreshToken)."
+            )
+        if r.status_code in _TRANSIENT_RETRY_STATUSES:
+            log(
+                f"event=firebase_refresh attempt={attempt + 1} "
+                f"classification=transient http={r.status_code}"
+            )
+            time.sleep(RETRY_DELAY_SECS)
+            continue
+        # Other 4xx: surface as a hard runtime error so the retry classifier
+        # in the caller doesn't loop on a misconfiguration (e.g. wrong
+        # API key shape).
+        log(
+            f"event=firebase_refresh status=failed http={r.status_code} "
+            f"classification=permanent"
+        )
+        raise RuntimeError(f"Firebase refresh failed: {last_err}")
+    raise RuntimeError(
+        f"Firebase refresh failed after {FIREBASE_REFRESH_MAX_ATTEMPTS} "
+        f"attempts: {last_err}"
+    )
+
+
+def _load_fallback_token():
+    """Return ``(token, source)`` from AIDRIVE_TOKEN_FILE / AIDRIVE_TOKEN.
+
+    Both sources are re-read on every call (rather than reusing the value
+    captured at import time in ``_AIDRIVE_TOKEN_ENV``) so an operator can
+    swap in a refreshed JWT mid-run without restarting the process.
+    """
+    if AIDRIVE_TOKEN_FILE:
+        token = _read_token_file(AIDRIVE_TOKEN_FILE)
+        if token:
+            return token, f"file:{AIDRIVE_TOKEN_FILE}"
+    token = os.environ.get("AIDRIVE_TOKEN", "").strip()
+    if token:
+        return token, "env:AIDRIVE_TOKEN"
+    return "", None
+
+
+def get_aidrive_token():
+    """Return a usable AI Drive bearer JWT.
+
+    Resolution order:
+
+    1. Cached Firebase-refreshed JWT, if still valid (proactive expiry).
+    2. Mint a fresh JWT via :func:`refresh_firebase_token` when refresh
+       credentials are configured.
+    3. Cached non-Firebase token if it has not changed.
+    4. ``AIDRIVE_TOKEN_FILE`` then ``AIDRIVE_TOKEN`` (manual fallback).
+
+    The token is held in memory only — it is never written to disk and
+    never logged in full. A structured ``event=token_*`` line is emitted
+    whenever the resolved token changes so refresh activity is traceable.
+    """
+    cached_value = _aidrive_token_cache.get("value")
+    cached_source = _aidrive_token_cache.get("source")
+    cached_exp = _aidrive_token_cache.get("expires_at")
+
+    # 1. Reuse cached Firebase-minted token while it's still good.
+    if (
+        cached_value
+        and cached_source == "firebase"
+        and not is_token_expired(cached_exp)
+    ):
+        return cached_value
+
+    # 2. Prefer Firebase auto-refresh when configured.
+    if AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY:
+        if cached_value and cached_source == "firebase":
+            log(
+                "event=token_refresh_due reason=expired_or_near_expiry "
+                "source=firebase"
+            )
+        return refresh_firebase_token()
+
+    # 3 + 4. Manual fallback — keep prior behaviour.
+    token, source = _load_fallback_token()
+    if not token:
+        raise AIDriveAuthExpired(
+            "AI Drive JWT is not available — set AIDRIVE_REFRESH_TOKEN + "
+            "AIDRIVE_FIREBASE_API_KEY (preferred) or AIDRIVE_TOKEN / "
+            "AIDRIVE_TOKEN_FILE."
+        )
+    if cached_value != token:
+        if cached_value is None:
+            log(f"event=token_loaded source={source}")
+        else:
+            log(
+                f"event=token_reloaded source={source} "
+                f"reason=value_changed"
+            )
+        # Best-effort expiry from the JWT itself so we still know when to
+        # treat the manual token as stale.
+        exp_claim = _decode_jwt_exp(token)
+        _aidrive_token_cache.update(
+            {
+                "value": token,
+                "source": source,
+                "expires_at": float(exp_claim) if exp_claim else None,
+            }
+        )
+    return token
+
+
+def get_valid_aidrive_token():
+    """Return a token guaranteed not to be near expiry.
+
+    Convenience wrapper that proactively refreshes the cached token when
+    it is within the refresh skew window. Equivalent to calling
+    :func:`get_aidrive_token` plus an explicit expiry check, exposed as a
+    distinct helper so callers (and tests) can document the proactive
+    intent explicitly.
+    """
+    cached_value = _aidrive_token_cache.get("value")
+    cached_exp = _aidrive_token_cache.get("expires_at")
+    if cached_value and not is_token_expired(cached_exp):
+        return cached_value
+    return get_aidrive_token()
+
+
+def force_reload_aidrive_token():
+    """Drop the cached token and re-resolve.
+
+    Returns ``(old_token, new_token)``. Used after an AI Drive AUTH_REQUIRED
+    response: with Firebase credentials this triggers a fresh refresh;
+    without them it re-reads ``AIDRIVE_TOKEN_FILE`` / ``AIDRIVE_TOKEN`` so
+    an operator can swap in a new manually-pasted JWT mid-run.
+    """
+    old_token = _aidrive_token_cache.get("value")
+    _aidrive_token_cache.update({"value": None, "expires_at": None})
+    try:
+        new_token = get_aidrive_token()
+    except AIDriveAuthExpired:
+        new_token = None
+    return old_token, new_token
 
 
 def get_gmail_service():
@@ -428,19 +890,51 @@ def build_folder_path(parsed_date):
 
 
 def aidrive_headers():
+    """Return AI Drive request headers with a guaranteed-valid bearer JWT.
+
+    Uses :func:`get_valid_aidrive_token` so a near-expiry token is refreshed
+    proactively (via Firebase when configured) before the request goes out,
+    rather than waiting for an AUTH_REQUIRED response.
+    """
     return {
-        "Authorization": f"Bearer {AIDRIVE_TOKEN}",
+        "Authorization": f"Bearer {get_valid_aidrive_token()}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
 
+# Status codes worth retrying for transient AI Drive failures.
+_TRANSIENT_RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# requests exception types that always represent transient transport issues
+# (connection resets, DNS hiccups, read/connect timeouts).
+_TRANSIENT_NETWORK_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
 def _post_with_retries(url, json_body, label):
-    """POST JSON to ``url`` with retries. Returns parsed JSON on success or
-    raises RuntimeError after exhausting retries. Network/transport exceptions
-    are caught and treated as retryable."""
+    """POST JSON to ``url`` with smart retry classification.
+
+    Retries ONLY transient failures: HTTP 408/429/5xx, connection resets and
+    timeouts. Permanent failures fail fast:
+
+    * Expired / invalid JWT (HTTP 401, AUTH_REQUIRED, "invalid token") →
+      one token reload is attempted; if the token is unchanged or the next
+      attempt still fails the same way, :class:`AIDriveAuthExpired` is
+      raised so the caller can preserve checkpoint state and exit.
+    * Other 4xx (validation errors, unsupported file types, malformed
+      payloads) → :class:`AIDrivePermanentError` is raised immediately.
+
+    Returns parsed JSON on success.
+    """
     last_err = None
+    auth_reload_attempted = False
     for attempt in range(MAX_RETRIES):
+        status = None
+        body = ""
         try:
             r = requests.post(
                 url,
@@ -448,13 +942,86 @@ def _post_with_retries(url, json_body, label):
                 json=json_body,
                 timeout=REQUEST_TIMEOUT_SECS,
             )
-            if r.status_code == 200:
+            status = r.status_code
+            body = r.text or ""
+            if status == 200:
                 return r.json()
-            last_err = f"HTTP {r.status_code} {r.text[:200]}"
+            last_err = f"HTTP {status} {body[:200]}"
+        except _TRANSIENT_NETWORK_EXCEPTIONS as e:
+            last_err = f"network error: {type(e).__name__}: {e}"
+            log(
+                f"{label} attempt {attempt + 1} classification=transient "
+                f"reason=network_error err={last_err}"
+            )
+            if attempt == MAX_RETRIES - 1:
+                break
+            time.sleep(RETRY_DELAY_SECS)
+            continue
         except requests.RequestException as e:
-            last_err = f"network error: {e}"
-        log(f"{label} attempt {attempt + 1} failed: {last_err}")
+            # Other requests errors (e.g. invalid URL, SSL handshake) are
+            # not transient — surface immediately as a permanent error.
+            raise AIDrivePermanentError(
+                f"{label} permanent transport error: {type(e).__name__}: {e}"
+            ) from e
+
+        # Classify the HTTP response.
+        if _looks_like_auth_failure(status, body):
+            log(
+                f"{label} attempt {attempt + 1} classification=auth_failure "
+                f"status={status}"
+            )
+            if not auth_reload_attempted:
+                auth_reload_attempted = True
+                try:
+                    old_tok, new_tok = force_reload_aidrive_token()
+                except AIDriveAuthExpired:
+                    old_tok, new_tok = _aidrive_token_cache.get("value"), None
+                if new_tok and new_tok != old_tok:
+                    log(
+                        f"event=auth_recovery action=token_refreshed "
+                        f"label={label} source={_aidrive_token_cache.get('source')} "
+                        "— retrying once with refreshed JWT"
+                    )
+                    continue
+                log(
+                    "event=auth_failure action=give_up "
+                    "reason=refresh_did_not_yield_new_token "
+                    f"label={label}"
+                )
+            raise AIDriveAuthExpired(
+                f"AI Drive JWT expired — refresh required ({label}: HTTP {status})"
+            )
+
+        if status in _TRANSIENT_RETRY_STATUSES:
+            log(
+                f"{label} attempt {attempt + 1} classification=transient "
+                f"status={status} err={last_err}"
+            )
+            if attempt == MAX_RETRIES - 1:
+                break
+            time.sleep(RETRY_DELAY_SECS)
+            continue
+
+        # Any other 4xx is a permanent client error — invalid payload,
+        # validation error, unsupported file type, etc. Do not retry.
+        if status is not None and 400 <= status < 500:
+            log(
+                f"{label} attempt {attempt + 1} classification=permanent "
+                f"status={status} err={last_err}"
+            )
+            raise AIDrivePermanentError(
+                f"{label} permanent failure: {last_err}"
+            )
+
+        # Unknown status — treat as transient to be safe.
+        log(
+            f"{label} attempt {attempt + 1} classification=transient "
+            f"status={status} err={last_err}"
+        )
+        if attempt == MAX_RETRIES - 1:
+            break
         time.sleep(RETRY_DELAY_SECS)
+
     raise RuntimeError(f"{label} failed after {MAX_RETRIES} retries: {last_err}")
 
 
@@ -503,7 +1070,12 @@ def request_signed_urls(file_batch):
 
 
 def upload_to_gcs(signed_url_obj, raw_bytes):
-    """PUT the bytes to Google Cloud Storage using the signed URL."""
+    """PUT the bytes to Google Cloud Storage using the signed URL.
+
+    Retries only transient failures (HTTP 408/429/5xx, connection resets,
+    timeouts). Permanent 4xx responses fail fast — re-PUTting a malformed
+    request to the same signed URL will keep returning the same error.
+    """
     url = signed_url_obj["url"]
     extra_headers = signed_url_obj.get("headers") or {}
     headers = {"Content-Type": "message/rfc822"}
@@ -517,10 +1089,36 @@ def upload_to_gcs(signed_url_obj, raw_bytes):
             if r.status_code in (200, 201):
                 return True
             last_err = f"HTTP {r.status_code} {r.text[:200]}"
+            if r.status_code in _TRANSIENT_RETRY_STATUSES:
+                log(
+                    f"GCS PUT attempt {attempt + 1} classification=transient "
+                    f"status={r.status_code}"
+                )
+            elif 400 <= r.status_code < 500:
+                log(
+                    f"GCS PUT attempt {attempt + 1} classification=permanent "
+                    f"status={r.status_code} err={last_err}"
+                )
+                return False
+            else:
+                log(
+                    f"GCS PUT attempt {attempt + 1} classification=transient "
+                    f"status={r.status_code}"
+                )
+        except _TRANSIENT_NETWORK_EXCEPTIONS as e:
+            last_err = f"network error: {type(e).__name__}: {e}"
+            log(
+                f"GCS PUT attempt {attempt + 1} classification=transient "
+                f"reason=network_error err={last_err}"
+            )
         except requests.RequestException as e:
-            last_err = f"network error: {e}"
-        log(f"GCS PUT attempt {attempt + 1} failed: {last_err}")
+            log(
+                f"GCS PUT attempt {attempt + 1} classification=permanent "
+                f"err={type(e).__name__}: {e}"
+            )
+            return False
         time.sleep(RETRY_DELAY_SECS)
+    log(f"GCS PUT failed after {MAX_RETRIES} retries: {last_err}")
     return False
 
 
@@ -539,7 +1137,13 @@ def register_upload(drive_object, signed_url_str, size_mb, success, duration):
             "file_upload_status_v2",
         )
         return True
-    except RuntimeError as e:
+    except AIDriveAuthExpired:
+        # Bubble up so the run-level handler can preserve checkpoint state
+        # and exit cleanly. The upload itself already succeeded; the next
+        # run with a refreshed JWT will re-register through the normal
+        # idempotent flow.
+        raise
+    except (AIDrivePermanentError, RuntimeError) as e:
         log(f"register_upload failed: {e}")
         return False
 
@@ -595,6 +1199,101 @@ def _incremental_window():
     start = today - timedelta(days=INCREMENTAL_LOOKBACK_DAYS)
     end = today + timedelta(days=1)
     return start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+
+
+# ---------------------------------------------------------------------------
+# Resumable-checkpoint helpers (historical mode)
+# ---------------------------------------------------------------------------
+#
+# The checkpoint file records every (start, end) chunk that has finished
+# successfully. On the next run those chunks are skipped, so an interrupted
+# historical backfill (expired JWT, network outage, manual cancellation)
+# resumes from where it left off instead of restarting all 12 months from
+# scratch. The file is intentionally tiny (a JSON list of strings) and is
+# written atomically so a crash mid-write cannot corrupt the state.
+
+CHECKPOINT_VERSION = 1
+
+
+def _chunk_key(start_str, end_str):
+    return f"{start_str}|{end_str}"
+
+
+def load_checkpoint(path=None):
+    """Load completed-chunk keys from the checkpoint file.
+
+    Returns a set. Missing / unreadable / malformed files are treated as an
+    empty checkpoint so a corrupt file never blocks a re-run.
+    """
+    path = path or CHECKPOINT_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        log(f"event=checkpoint_restore status=empty path={path}")
+        return set()
+    except (OSError, json.JSONDecodeError) as e:
+        log(
+            f"event=checkpoint_restore status=ignored_corrupt path={path} "
+            f"err={type(e).__name__}: {e}"
+        )
+        return set()
+    if not isinstance(data, dict):
+        log(f"event=checkpoint_restore status=ignored_bad_format path={path}")
+        return set()
+    completed = data.get("completed_chunks") or []
+    if not isinstance(completed, list):
+        log(f"event=checkpoint_restore status=ignored_bad_format path={path}")
+        return set()
+    keys = {str(k) for k in completed}
+    log(
+        f"event=checkpoint_restore status=loaded path={path} "
+        f"completed_chunks={len(keys)}"
+    )
+    return keys
+
+
+def save_checkpoint(completed_keys, path=None):
+    """Atomically persist the set of completed chunk keys.
+
+    Writes to a sibling temp file and renames into place so a crash or
+    SIGKILL mid-write cannot leave a partially-written (and unparseable)
+    checkpoint file behind.
+    """
+    path = path or CHECKPOINT_FILE
+    payload = {
+        "version": CHECKPOINT_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "completed_chunks": sorted(completed_keys),
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".checkpoint-", suffix=".json.tmp", dir=directory
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            # Best-effort cleanup of the temp file.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        log(
+            f"event=checkpoint_save path={path} "
+            f"completed_chunks={len(completed_keys)}"
+        )
+    except OSError as e:
+        log(
+            f"event=checkpoint_save status=failed path={path} "
+            f"err={type(e).__name__}: {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +1353,18 @@ def process_window(service, label_id, start_str, end_str):
 
         try:
             signed_responses = request_signed_urls(batch_meta)
+        except AIDriveAuthExpired:
+            # Don't drop the batch silently — propagate so the run-level
+            # handler preserves checkpoint state and exits cleanly.
+            raise
+        except AIDrivePermanentError as e:
+            log(
+                f"  Batch signed-URL request rejected as permanent failure: "
+                f"{e}. Skipping batch (no retry)."
+            )
+            failures += len(batch)
+            batch.clear()
+            return
         except Exception as e:
             log(f"  Batch signed-URL request failed: {e}. Skipping batch.")
             failures += len(batch)
@@ -787,96 +1498,135 @@ def process_window(service, label_id, start_str, end_str):
     return successes, failures, len(msg_ids)
 
 
+def _run_historical(service, label_id):
+    """Historical mode with resumable checkpoints."""
+    log(f"Folder: {AIDRIVE_FOLDER}. Per-chunk cap: {MAX_EMAILS}")
+
+    chunks = list(_monthly_chunks(months_back=12))
+    log(f"Total chunks to process: {len(chunks)}")
+
+    completed = load_checkpoint()
+    skipped_chunks = 0
+    for start_str, end_str in chunks:
+        if _chunk_key(start_str, end_str) in completed:
+            skipped_chunks += 1
+    if skipped_chunks:
+        log(
+            f"event=checkpoint_skip count={skipped_chunks} "
+            f"reason=already_completed_in_previous_run"
+        )
+
+    total_successes, total_failures, total_candidates = 0, 0, 0
+    for idx, (start_str, end_str) in enumerate(chunks, start=1):
+        key = _chunk_key(start_str, end_str)
+        if key in completed:
+            log(
+                f"\n[Chunk {idx}/{len(chunks)}] {start_str} → {end_str} "
+                f"event=skipped reason=checkpoint"
+            )
+            continue
+        log(f"\n[Chunk {idx}/{len(chunks)}] {start_str} → {end_str}")
+        s, f, c = process_window(service, label_id, start_str, end_str)
+        total_successes += s
+        total_failures += f
+        total_candidates += c
+        log(
+            f"[Chunk {idx}/{len(chunks)}] done — "
+            f"successes: {s}, failures: {f}, candidates: {c}"
+        )
+        # Persist progress immediately so a later failure cannot lose this chunk.
+        completed.add(key)
+        save_checkpoint(completed)
+
+    log(
+        f"\nHistorical backfill complete. "
+        f"Total successes: {total_successes}, "
+        f"failures: {total_failures}, "
+        f"candidates: {total_candidates}"
+    )
+    return total_failures
+
+
 def main():
     log("=" * 60)
 
-    if RUN_MODE == "historical":
-        # -------------------------------------------------------------------
-        # HISTORICAL mode: automatically process the last 12 months,
-        # one calendar month at a time.
-        # -------------------------------------------------------------------
-        log("MODE: historical — processing last 12 months month by month")
-        log(f"Folder: {AIDRIVE_FOLDER}. Per-chunk cap: {MAX_EMAILS}")
-        service = get_gmail_service()
-        label_id = ensure_processed_label(service)
-        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+    try:
+        if RUN_MODE == "historical":
+            log("MODE: historical — processing last 12 months month by month")
+            service = get_gmail_service()
+            label_id = ensure_processed_label(service)
+            log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+            failures = _run_historical(service, label_id)
+            if failures > 0:
+                sys.exit(1)
 
-        chunks = list(_monthly_chunks(months_back=12))
-        log(f"Total chunks to process: {len(chunks)}")
+        elif RUN_MODE == "incremental":
+            # ---------------------------------------------------------------
+            # INCREMENTAL mode: sync recent mail (scheduled every 30 minutes).
+            # ---------------------------------------------------------------
+            start_str, end_str = _incremental_window()
+            log(
+                f"MODE: incremental — syncing new mail "
+                f"(lookback {INCREMENTAL_LOOKBACK_DAYS} day(s): "
+                f"{start_str} → {end_str})"
+            )
+            log(f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
+            service = get_gmail_service()
+            label_id = ensure_processed_label(service)
+            log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
 
-        total_successes, total_failures, total_candidates = 0, 0, 0
-        for idx, (start_str, end_str) in enumerate(chunks, start=1):
-            log(f"\n[Chunk {idx}/{len(chunks)}] {start_str} → {end_str}")
             s, f, c = process_window(service, label_id, start_str, end_str)
-            total_successes += s
-            total_failures += f
-            total_candidates += c
             log(
-                f"[Chunk {idx}/{len(chunks)}] done — "
-                f"successes: {s}, failures: {f}, candidates: {c}"
+                f"\nIncremental sync complete. "
+                f"Successes: {s}, failures: {f}, candidates: {c}"
             )
+            if f > 0:
+                sys.exit(1)
 
-        log(
-            f"\nHistorical backfill complete. "
-            f"Total successes: {total_successes}, "
-            f"failures: {total_failures}, "
-            f"candidates: {total_candidates}"
-        )
-        if total_failures > 0:
-            sys.exit(1)
+        else:
+            # ---------------------------------------------------------------
+            # CUSTOM mode: use explicit START_DATE and END_DATE.
+            # ---------------------------------------------------------------
+            if not START_DATE or not END_DATE:
+                log(
+                    "ERROR: RUN_MODE is not set. "
+                    "Provide START_DATE and END_DATE for a custom range, "
+                    "or set RUN_MODE=historical or RUN_MODE=incremental."
+                )
+                sys.exit(1)
 
-    elif RUN_MODE == "incremental":
-        # -------------------------------------------------------------------
-        # INCREMENTAL mode: sync recent mail (scheduled every 30 minutes).
-        # Queries the last INCREMENTAL_LOOKBACK_DAYS days; the
-        # aidrive-archived label prevents re-uploading already-synced mail.
-        # -------------------------------------------------------------------
-        start_str, end_str = _incremental_window()
-        log(
-            f"MODE: incremental — syncing new mail "
-            f"(lookback {INCREMENTAL_LOOKBACK_DAYS} day(s): "
-            f"{start_str} → {end_str})"
-        )
-        log(f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
-        service = get_gmail_service()
-        label_id = ensure_processed_label(service)
-        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
-
-        s, f, c = process_window(service, label_id, start_str, end_str)
-        log(
-            f"\nIncremental sync complete. "
-            f"Successes: {s}, failures: {f}, candidates: {c}"
-        )
-        if f > 0:
-            sys.exit(1)
-
-    else:
-        # -------------------------------------------------------------------
-        # CUSTOM mode: use explicit START_DATE and END_DATE (original behavior).
-        # -------------------------------------------------------------------
-        if not START_DATE or not END_DATE:
             log(
-                "ERROR: RUN_MODE is not set. "
-                "Provide START_DATE and END_DATE for a custom range, "
-                "or set RUN_MODE=historical or RUN_MODE=incremental."
+                f"MODE: custom range — {START_DATE} → {END_DATE}. "
+                f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
             )
-            sys.exit(1)
+            service = get_gmail_service()
+            label_id = ensure_processed_label(service)
+            log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
 
-        log(
-            f"MODE: custom range — {START_DATE} → {END_DATE}. "
-            f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
-        )
-        service = get_gmail_service()
-        label_id = ensure_processed_label(service)
-        log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
+            s, f, c = process_window(service, label_id, START_DATE, END_DATE)
+            log(
+                f"\nCustom-range run complete. "
+                f"Successes: {s}, failures: {f}, candidates: {c}"
+            )
+            if f > 0:
+                sys.exit(1)
 
-        s, f, c = process_window(service, label_id, START_DATE, END_DATE)
+    except AIDriveAuthExpired as e:
+        # Stop the current batch cleanly. Any historical chunks already
+        # finished are preserved in the checkpoint file (saved per-chunk),
+        # so a re-run with a refreshed JWT resumes where this run stopped.
+        log("=" * 60)
+        log("AI Drive JWT expired — refresh required")
+        log(f"event=auth_failure detail={e}")
         log(
-            f"\nCustom-range run complete. "
-            f"Successes: {s}, failures: {f}, candidates: {c}"
+            "Refresh the Bearer JWT (browser DevTools → copy from a logged-in "
+            "AI Drive request) and update AIDRIVE_TOKEN (or the file pointed "
+            "to by AIDRIVE_TOKEN_FILE), then re-run. Historical progress is "
+            f"preserved in {CHECKPOINT_FILE}."
         )
-        if f > 0:
-            sys.exit(1)
+        # Use a distinct exit code so callers / CI can react specifically to
+        # an auth-expiry termination vs ordinary failures.
+        sys.exit(2)
 
 
 if __name__ == "__main__":
