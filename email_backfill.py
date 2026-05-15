@@ -63,6 +63,7 @@ import requests
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # === Config ===
 AIDRIVE_BASE = "https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app"
@@ -118,21 +119,93 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _explain_http_error_and_exit(err):
+    """Detects common, actionable Gmail API errors and exits with guidance."""
+    status = getattr(getattr(err, "resp", None), "status", None)
+    body = ""
+    try:
+        body = err.content.decode("utf-8", errors="ignore") if err.content else ""
+    except Exception:
+        body = str(err)
+
+    # Gmail API not enabled in the GCP project that owns the OAuth client.
+    if status == 403 and "accessNotConfigured" in body:
+        # Try to surface the project number from the error body so the user
+        # knows exactly which project to enable the API in.
+        project_match = re.search(r"project[s]?[/=](\d+)", body)
+        project_hint = (
+            f" (project {project_match.group(1)})" if project_match else ""
+        )
+        log("ERROR: Gmail API is not enabled for this Google Cloud project"
+            f"{project_hint}.")
+        log("       Enable it at: "
+            "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview"
+            + (f"?project={project_match.group(1)}" if project_match else ""))
+        log("       After enabling, wait 1–2 minutes for propagation and re-run.")
+        sys.exit(1)
+
+    if status == 401:
+        log("ERROR: Gmail rejected the OAuth credentials (HTTP 401). "
+            "Regenerate GMAIL_REFRESH_TOKEN with get_gmail_token.py and ensure "
+            "GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET match the same OAuth client.")
+        sys.exit(1)
+
+
 def ensure_processed_label(service):
-    """Returns the Gmail label id for aidrive-archived, creating it if needed."""
-    labels = service.users().labels().list(userId="me").execute().get("labels", [])
-    for lbl in labels:
-        if lbl["name"] == PROCESSED_LABEL:
-            return lbl["id"]
-    created = service.users().labels().create(
-        userId="me",
-        body={
-            "name": PROCESSED_LABEL,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        },
-    ).execute()
-    return created["id"]
+    """Returns the Gmail label id for aidrive-archived, creating it if needed.
+
+    The first Gmail call is wrapped in a bounded retry loop so transient
+    issues (notably the brief propagation delay right after enabling the
+    Gmail API in the GCP console) don't fail the whole run. Permanent,
+    actionable errors are translated to a clear message and a fast exit.
+    """
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            labels = (
+                service.users().labels().list(userId="me").execute().get("labels", [])
+            )
+            for lbl in labels:
+                if lbl["name"] == PROCESSED_LABEL:
+                    return lbl["id"]
+            created = service.users().labels().create(
+                userId="me",
+                body={
+                    "name": PROCESSED_LABEL,
+                    "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show",
+                },
+            ).execute()
+            return created["id"]
+        except HttpError as e:
+            last_err = e
+            status = getattr(getattr(e, "resp", None), "status", None)
+            # Don't retry permanent client errors except 403
+            # accessNotConfigured, which can be transient right after the
+            # API is enabled in the GCP console.
+            body = ""
+            try:
+                body = e.content.decode("utf-8", errors="ignore") if e.content else ""
+            except Exception:
+                pass
+            transient = (
+                status is None
+                or status >= 500
+                or status == 429
+                or (status == 403 and "accessNotConfigured" in body)
+            )
+            if not transient or attempt == MAX_RETRIES - 1:
+                _explain_http_error_and_exit(e)
+                raise
+            log(
+                f"ensure_processed_label attempt {attempt + 1} failed "
+                f"(HTTP {status}); retrying in {RETRY_DELAY_SECS}s..."
+            )
+            time.sleep(RETRY_DELAY_SECS)
+    # Should be unreachable, but keep a safe fallback.
+    raise RuntimeError(
+        f"ensure_processed_label failed after {MAX_RETRIES} retries: {last_err}"
+    )
 
 
 def sanitize_for_filename(text, max_len=80):

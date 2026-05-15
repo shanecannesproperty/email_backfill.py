@@ -141,6 +141,12 @@ No separate handling is needed.
 
 * The Gmail OAuth token must hold the `gmail.modify` scope (needed both to
   read messages in `raw` format and to apply the processed label).
+* The **Gmail API must be enabled** in the same Google Cloud project that
+  owns the OAuth client (`GMAIL_CLIENT_ID`). If it isn't, the first Gmail
+  call fails with HTTP 403 `accessNotConfigured`. Enable it at
+  <https://console.developers.google.com/apis/api/gmail.googleapis.com/overview>
+  and wait 1–2 minutes for propagation; the script retries the initial
+  call to absorb that delay.
 * AI Drive endpoints are hardcoded to
   `https://ai-drive-api-prod-qvg2narjsa-uc.a.run.app` —
   `signed_url_upload_batch_v2` and `file_upload_status_v2`. Update
