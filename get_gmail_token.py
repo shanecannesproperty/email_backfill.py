@@ -8,7 +8,7 @@ Run this ONCE on your Mac. It will:
 2. Print a refresh token
 
 Paste the refresh token (plus your client id and client secret) into
-GitHub Secrets as GMAIL_REFRESH_TOKEN, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET.
+GitHub Secrets as GMAIL_REFRESH_TOKEN, GMAIL_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET.
 
 Prerequisite: A credentials.json file in the same folder, downloaded
 from Google Cloud Console (OAuth 2.0 Client ID, type "Desktop app").
@@ -28,7 +28,7 @@ def main():
     creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
     print("\n=== COPY THESE VALUES INTO GITHUB SECRETS ===\n")
     print(f"GMAIL_CLIENT_ID:\n{creds.client_id}\n")
-    print(f"GMAIL_CLIENT_SECRET:\n{creds.client_secret}\n")
+    print(f"GOOGLE_OAUTH_CLIENT_SECRET:\n{creds.client_secret}\n")
     print(f"GMAIL_REFRESH_TOKEN:\n{creds.refresh_token}\n")
     print("Done. You can delete credentials.json after this.")
 

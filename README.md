@@ -38,7 +38,7 @@ python get_gmail_token.py
 ```
 
 This opens a browser window so you can grant the `gmail.modify` scope. On
-success it prints `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and
+success it prints `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
 `GMAIL_REFRESH_TOKEN`. Delete `credentials.json` afterwards.
 
 ### 3. Configure GitHub repository secrets
@@ -49,7 +49,7 @@ Add the following under **Settings → Secrets and variables → Actions**:
 | --- | --- |
 | `AIDRIVE_API_KEY` | API key for your AI Drive account. |
 | `GMAIL_CLIENT_ID` | OAuth client id from step 2. |
-| `GMAIL_CLIENT_SECRET` | OAuth client secret from step 2. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth client secret from step 2. |
 | `GMAIL_REFRESH_TOKEN` | Refresh token from step 2. |
 
 ## Operating modes
@@ -185,8 +185,7 @@ python email_backfill.py
   is sufficient for typical mailbox sizes; very large mailboxes (100 k+ emails)
   may need to be split into smaller custom date-range runs.
 * **Scheduled runs require secrets** — If any of the four secrets
-  (`AIDRIVE_API_KEY`, `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`,
+  (`AIDRIVE_API_KEY`, `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
   `GMAIL_REFRESH_TOKEN`) are missing or expired, scheduled runs will fail and
   show as red in the Actions tab. Renew the refresh token via `get_gmail_token.py`
   if Gmail authentication stops working.
-
