@@ -721,8 +721,8 @@ _MAX_FILENAME_BASE_LEN = 120
 # 822 messages must therefore be serialized to ``.txt`` before upload (see
 # :func:`render_email_as_text`). Keep lowercase, leading dot.
 ALLOWED_EXTENSIONS = frozenset({
-    ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc",
-    ".pptx", ".ppt", ".txt", ".md",
+    ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc", ".dotx",
+    ".pptx", ".ppt", ".txt", ".xer", ".md",
 })
 
 # MIME → extension hints used when a filename has no usable extension.
@@ -833,7 +833,11 @@ def validate_drive_object(drive_object):
     if file_type is not None:
         if not isinstance(file_type, str) or not file_type:
             return False, "file_type must be a non-empty string"
-        if f".{file_type.lower().lstrip('.')}" not in ALLOWED_EXTENSIONS:
+        # AI Drive expects the dotted form (e.g. ".txt"). Sending the bare
+        # extension (e.g. "txt") triggers HTTP 422 validation errors.
+        if not file_type.startswith("."):
+            return False, f"file_type {file_type!r} must include the leading dot"
+        if file_type.lower() not in ALLOWED_EXTENSIONS:
             return False, f"file_type {file_type!r} is not supported by AI Drive"
     return True, ""
 
@@ -1110,8 +1114,9 @@ def _post_with_retries(url, json_body, label):
       one token reload is attempted; if the token is unchanged or the next
       attempt still fails the same way, :class:`AIDriveAuthExpired` is
       raised so the caller can preserve checkpoint state and exit.
-    * Other 4xx (validation errors, unsupported file types, malformed
-      payloads) → :class:`AIDrivePermanentError` is raised immediately.
+    * Other 4xx (validation errors including HTTP 422, unsupported file
+      types, malformed payloads) → :class:`AIDrivePermanentError` is
+      raised immediately. 422 validation errors are NEVER retried.
 
     Returns parsed JSON on success.
     """
@@ -1210,12 +1215,110 @@ def _post_with_retries(url, json_body, label):
     raise RuntimeError(f"{label} failed after {MAX_RETRIES} retries: {last_err}")
 
 
+def _is_email_record(file_meta):
+    """Return True if ``file_meta`` represents a Gmail/email record.
+
+    Email records are rendered to plain text before upload (AI Drive does
+    not accept ``.eml`` / ``message/rfc822``), so we detect them by their
+    final extension or by an explicit hint on the meta dict.
+    """
+    if file_meta.get("is_email"):
+        return True
+    name = (file_meta.get("name") or "").lower()
+    file_type = (file_meta.get("file_type") or "").lower()
+    return name.endswith(".eml") or file_type in (".eml", "eml", "message/rfc822")
+
+
+def _normalize_file_type_for_payload(file_meta):
+    """Force ``file_type`` (and the filename extension for email records)
+    into the AI-Drive-supported, dotted form.
+
+    * Email records always become ``.txt`` — never ``.eml`` /
+      ``message/rfc822`` — and have their filename extension rewritten to
+      ``.txt`` so the on-disk name matches the declared type.
+    * Any other unsupported ``file_type`` is hard-converted to ``.txt``.
+    * The dotted form is enforced (e.g. ``"txt"`` → ``".txt"``).
+
+    Emits ``AI Drive file_type normalized original=<old> final=<new>``
+    whenever the value is rewritten. Returns the normalized ``file_meta``
+    dict.
+    """
+    original = file_meta.get("file_type")
+
+    if _is_email_record(file_meta):
+        # Hard rule: every Gmail/email record uploads as plain text.
+        final = ".txt"
+        name = file_meta.get("name") or ""
+        if not name.lower().endswith(".txt"):
+            dot = name.rfind(".")
+            base = name[:dot] if dot > 0 else name
+            file_meta["name"] = (base or "untitled") + ".txt"
+    else:
+        # Coerce to the dotted form and downcase.
+        if isinstance(original, str) and original:
+            candidate = original.lower()
+            if not candidate.startswith("."):
+                candidate = "." + candidate
+        else:
+            candidate = ""
+        # Hard assertion: unsupported file_type is converted to .txt.
+        final = candidate if candidate in ALLOWED_EXTENSIONS else ".txt"
+
+    if final != original:
+        log(
+            f"AI Drive file_type normalized original={original!r} "
+            f"final={final!r}"
+        )
+    file_meta["file_type"] = final
+    return file_meta
+
+
+# Keys whose values are redacted before logging an AI Drive payload. The
+# signed-URL request body itself does not carry secrets — the bearer JWT
+# lives in request *headers* — but defence-in-depth: drop anything that
+# looks like an authorization/token field if a future caller adds one.
+_AIDRIVE_REDACTED_PAYLOAD_KEYS = frozenset({
+    "authorization", "auth", "token", "id_token",
+    "access_token", "refresh_token", "api_key",
+})
+
+
+def _redact_aidrive_payload(body):
+    """Return a deep-ish copy of ``body`` safe to log."""
+    try:
+        cloned = json.loads(json.dumps(body))
+    except (TypeError, ValueError):
+        return {"<unserializable payload>": True}
+
+    def _walk(node):
+        if isinstance(node, dict):
+            for k in list(node.keys()):
+                if k.lower() in _AIDRIVE_REDACTED_PAYLOAD_KEYS:
+                    node[k] = "***REDACTED***"
+                else:
+                    _walk(node[k])
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(cloned)
+    return cloned
+
+
 def request_signed_urls(file_batch):
     """
     file_batch: list of dicts with keys: name, path, size, file_type
     Returns: list of SignedUrlResponseV2 items (one-to-one with file_batch).
     Raises RuntimeError if the API does not return one response per request.
     """
+    # Final normalization point: force every drive_object.file_type to a
+    # dotted, AI-Drive-supported extension (.txt for any email record or
+    # unsupported value). Done here so it cannot be bypassed by a caller
+    # that builds the meta dict differently. Permanent 422 validation
+    # errors are NOT retried (see _post_with_retries 4xx branch).
+    for f in file_batch:
+        _normalize_file_type_for_payload(f)
+
     body = {
         "files": [
             {
@@ -1230,6 +1333,24 @@ def request_signed_urls(file_batch):
             for f in file_batch
         ]
     }
+
+    # Belt-and-braces: assert every file_type is supported. If anything
+    # slipped through normalization, coerce it to .txt rather than letting
+    # AI Drive return HTTP 422.
+    for entry in body["files"]:
+        ft = entry["drive_object"]["file_type"]
+        if ft not in ALLOWED_EXTENSIONS:
+            log(
+                f"AI Drive file_type normalized original={ft!r} "
+                f"final={'.txt'!r}"
+            )
+            entry["drive_object"]["file_type"] = ".txt"
+
+    log(
+        "signed_url_upload_batch_v2 request payload="
+        + json.dumps(_redact_aidrive_payload(body), sort_keys=True)
+    )
+
     resp = _post_with_retries(
         f"{AIDRIVE_BASE}/signed_url_upload_batch_v2",
         body,
@@ -1533,6 +1654,7 @@ def process_window(service, label_id, start_str, end_str):
                 "path": item["drive_object"]["path"],
                 "size": item["size_bytes"],
                 "file_type": item["drive_object"]["file_type"],
+                "is_email": item.get("is_email", False),
             }
             for item in batch
         ]
@@ -1651,7 +1773,7 @@ def process_window(service, label_id, start_str, end_str):
             "name": filename,
             "path": folder_path,
             "isFile": True,
-            "file_type": final_ext.lstrip("."),
+            "file_type": final_ext,
         }
 
         # Validate the payload before sending it to signed_url_upload_batch_v2.
@@ -1687,6 +1809,7 @@ def process_window(service, label_id, start_str, end_str):
                 "size_bytes": size_bytes,
                 "size_mb": size_mb,
                 "content_type": upload_mime,
+                "is_email": True,
             }
         )
 
@@ -1714,7 +1837,7 @@ def process_window(service, label_id, start_str, end_str):
                 "name": att_filename,
                 "path": folder_path,
                 "isFile": True,
-                "file_type": att_final_ext.lstrip("."),
+                "file_type": att_final_ext,
             }
             att_valid, att_reason = validate_drive_object(att_drive_object)
             if not att_valid:
