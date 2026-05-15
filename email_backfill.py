@@ -33,7 +33,7 @@ OPERATING MODES (set via RUN_MODE environment variable):
 
 ENVIRONMENT VARIABLES:
 
-  AIDRIVE_API_KEY              your AI Drive API key
+  AIDRIVE_TOKEN                your AI Drive API token
   AIDRIVE_FOLDER               destination folder, e.g. "04 - EMAIL ARCHIVE"
   GMAIL_CLIENT_ID              OAuth client id from Google Cloud Console
   GMAIL_CLIENT_SECRET          OAuth client secret
@@ -86,7 +86,7 @@ def _require_env(name):
     return value
 
 
-AIDRIVE_API_KEY = _require_env("AIDRIVE_API_KEY")
+AIDRIVE_TOKEN = _require_env("AIDRIVE_TOKEN")
 AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
 GMAIL_CLIENT_ID = _require_env("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = _require_env("GMAIL_CLIENT_SECRET")
@@ -283,7 +283,7 @@ def build_folder_path(parsed_date):
 
 def aidrive_headers():
     return {
-        "Authorization": f"Bearer {AIDRIVE_API_KEY}",
+        "Authorization": f"Bearer {AIDRIVE_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
