@@ -234,6 +234,14 @@ FIREBASE_REFRESH_SKEW_SECS = 120
 # the process from busy-looping if the refresh token itself is revoked.
 FIREBASE_REFRESH_MAX_ATTEMPTS = 3
 
+# Default TTL assumed when the Firebase response omits expires_in and the
+# minted JWT carries no decodable exp claim. Conservative — Firebase ID
+# tokens are nominally valid for 1 hour; this leaves headroom to refresh.
+FIREBASE_DEFAULT_TTL_SECS = 50 * 60
+# JWT payloads are URL-safe base64 without padding; pad to a multiple of 4
+# before decoding.
+_BASE64_ALIGNMENT = 4
+
 _aidrive_token_cache = {
     "value": None,        # current bearer JWT (id_token)
     "source": None,       # "firebase" | "file:…" | "env:AIDRIVE_TOKEN"
@@ -264,8 +272,7 @@ def _decode_jwt_exp(token):
         return None
     try:
         payload_b64 = token.split(".")[1]
-        # JWT uses URL-safe base64 without padding.
-        padding = "=" * (-len(payload_b64) % 4)
+        padding = "=" * (-len(payload_b64) % _BASE64_ALIGNMENT)
         raw = base64.urlsafe_b64decode(payload_b64 + padding)
         claims = json.loads(raw.decode("utf-8", errors="ignore"))
     except (ValueError, json.JSONDecodeError):
@@ -375,9 +382,9 @@ def refresh_firebase_token():
             elif jwt_exp:
                 expires_at = float(jwt_exp)
             else:
-                # Conservative default: assume 50 minutes if neither hint
-                # is available so we still refresh proactively.
-                expires_at = now + 50 * 60
+                # Conservative default when neither expires_in nor an
+                # exp claim is available — still refresh proactively.
+                expires_at = now + FIREBASE_DEFAULT_TTL_SECS
             old = _aidrive_token_cache.get("value")
             _aidrive_token_cache.update(
                 {
@@ -447,7 +454,12 @@ def refresh_firebase_token():
 
 
 def _load_fallback_token():
-    """Return ``(token, source)`` from AIDRIVE_TOKEN_FILE / AIDRIVE_TOKEN."""
+    """Return ``(token, source)`` from AIDRIVE_TOKEN_FILE / AIDRIVE_TOKEN.
+
+    Both sources are re-read on every call (rather than reusing the value
+    captured at import time in ``_AIDRIVE_TOKEN_ENV``) so an operator can
+    swap in a refreshed JWT mid-run without restarting the process.
+    """
     if AIDRIVE_TOKEN_FILE:
         token = _read_token_file(AIDRIVE_TOKEN_FILE)
         if token:
