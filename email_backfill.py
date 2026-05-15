@@ -1769,13 +1769,6 @@ def process_window(service, label_id, start_str, end_str):
             failures += 1
             continue
 
-        # Emails are uploaded as RFC 822 bodies but AI Drive does not accept
-        # ``.eml``; archive them as ``.txt`` instead. ``mime_type`` is still
-        # recorded for logs and so ``normalize_extension`` has a sensible
-        # fallback (``message/rfc822`` → ``.txt`` via ``_MIME_TO_EXT``).
-        mime_type = "message/rfc822"
-        original_filename = (
-            f"{subject_raw}.txt" if subject_raw else f"{msg_id[:8]}.txt"
         # AI Drive does not accept ``message/rfc822`` (``.eml``) — it returns
         # HTTP 422. Render the email as a UTF-8 text document containing the
         # key headers (From / To / Date / Subject / Message-ID) followed by
