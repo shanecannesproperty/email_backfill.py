@@ -54,7 +54,7 @@ jobs:
 
       - name: Run email backfill
         env:
-          AIDRIVE_API_KEY: ${{ secrets.AIDRIVE_API_KEY }}
+          AIDRIVE_TOKEN: ${{ secrets.AIDRIVE_TOKEN }}
           AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
