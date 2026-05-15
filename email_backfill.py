@@ -209,12 +209,150 @@ def ensure_processed_label(service):
 
 
 def sanitize_for_filename(text, max_len=80):
-    """Strip path-breaking chars and clip length."""
+    """Strip path-breaking chars and clip length.
+
+    Kept for backwards compatibility; new code should use
+    :func:`sanitize_filename`, which is stricter and matches AI Drive's
+    rules for ``drive_object.name``.
+    """
     if not text:
         return "no-subject"
     cleaned = re.sub(r'[\/\\:*?"<>|\r\n\t]', "_", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:max_len] or "no-subject"
+
+
+# ---------------------------------------------------------------------------
+# AI Drive filename / extension sanitization
+# ---------------------------------------------------------------------------
+#
+# AI Drive's signed_url_upload_batch_v2 endpoint validates drive_object.name
+# server-side and rejects records that contain certain characters or that
+# carry an unsupported extension. The helpers below produce names that pass
+# that validation and never send unknown extensions to AI Drive.
+
+# Characters AI Drive rejects in drive_object.name. Stripped (replaced with a
+# space and then collapsed) rather than substituted with "_" so the resulting
+# name stays readable, e.g. "Lowered Prices [!] Most-Sold Styles [!!] 48
+# Hours Only" -> "Lowered Prices Most-Sold Styles 48 Hours Only".
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[\[\]!:?*<>|"\\/]')
+# Other control / whitespace characters that should never appear in a name.
+_CONTROL_WS_RE = re.compile(r"[\r\n\t\f\v\x00-\x1f]")
+# Maximum length of the *base* (pre-extension) part of the filename. Keeps
+# the full name comfortably under typical 255-byte filesystem limits even
+# after the timestamp/sender/msg-id prefix is added.
+_MAX_FILENAME_BASE_LEN = 120
+
+# Extensions AI Drive accepts. ``.eml`` is included because this archiver
+# uploads RFC 822 messages. Keep lowercase, leading dot.
+ALLOWED_EXTENSIONS = frozenset({
+    ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc",
+    ".pptx", ".ppt", ".txt", ".md", ".eml",
+})
+
+# MIME → extension hints used when a filename has no usable extension.
+_MIME_TO_EXT = {
+    "application/pdf": ".pdf",
+    "text/csv": ".csv",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "message/rfc822": ".eml",
+}
+
+FALLBACK_EXTENSION = ".txt"
+
+
+def sanitize_filename(text, max_len=_MAX_FILENAME_BASE_LEN):
+    """Return an AI-Drive-safe version of ``text`` for ``drive_object.name``.
+
+    * Removes characters AI Drive rejects: ``[ ] ! : ? * < > | " \\ /``
+    * Strips control characters
+    * Collapses any run of whitespace into a single space
+    * Trims leading/trailing whitespace and dots (Windows-hostile)
+    * Safely truncates the result to ``max_len`` characters while
+      preserving readability (prefers a word boundary)
+    * Returns a stable placeholder if the input becomes empty
+    """
+    if text is None:
+        return "untitled"
+    cleaned = _CONTROL_WS_RE.sub(" ", str(text))
+    cleaned = _INVALID_FILENAME_CHARS_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        return "untitled"
+    if len(cleaned) > max_len:
+        # Truncate on a word boundary when possible, fall back to a hard cut.
+        cut = cleaned[:max_len].rstrip()
+        space = cut.rfind(" ")
+        if space >= max_len - 20 and space > 0:
+            cut = cut[:space].rstrip()
+        cleaned = cut.rstrip(" .") or cleaned[:max_len]
+    return cleaned or "untitled"
+
+
+def normalize_extension(filename, mime_type=None):
+    """Return a valid AI-Drive extension (including the leading dot).
+
+    * If ``filename`` already ends with an allowed extension, that
+      extension is returned (lowercased).
+    * Otherwise ``mime_type`` is consulted via the MIME → extension map.
+    * If neither yields an allowed extension, :data:`FALLBACK_EXTENSION`
+      (``.txt``) is returned so the upload still has a valid extension.
+    """
+    if filename:
+        # Use the last dot so names like "foo.bar.pdf" resolve to ".pdf".
+        dot = filename.rfind(".")
+        if 0 < dot < len(filename) - 1:
+            ext = filename[dot:].lower()
+            if (
+                ext in ALLOWED_EXTENSIONS
+                and not _INVALID_FILENAME_CHARS_RE.search(ext)
+                and " " not in ext
+            ):
+                return ext
+    if mime_type:
+        mapped = _MIME_TO_EXT.get(mime_type.split(";", 1)[0].strip().lower())
+        if mapped in ALLOWED_EXTENSIONS:
+            return mapped
+    return FALLBACK_EXTENSION
+
+
+def validate_drive_object(drive_object):
+    """Validate a ``drive_object`` payload before sending it to AI Drive.
+
+    Returns ``(is_valid, reason)``. ``reason`` is the empty string when
+    valid. Permanent rejections (bad/missing name, bad extension, missing
+    path) should cause the caller to skip the record cleanly without
+    retrying — AI Drive will reject the same payload on every attempt.
+    """
+    if not isinstance(drive_object, dict):
+        return False, "drive_object is not a dict"
+    name = drive_object.get("name")
+    if not name or not isinstance(name, str):
+        return False, "missing or empty name"
+    if _INVALID_FILENAME_CHARS_RE.search(name):
+        return False, "name contains invalid characters"
+    if _CONTROL_WS_RE.search(name):
+        return False, "name contains control characters"
+    if name.strip() != name or name.endswith("."):
+        return False, "name has stray whitespace or trailing dot"
+    if len(name) > 255:
+        return False, "name exceeds 255 characters"
+    dot = name.rfind(".")
+    if dot <= 0 or dot == len(name) - 1:
+        return False, "name is missing an extension"
+    ext = name[dot:].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return False, f"extension {ext!r} is not in ALLOWED_EXTENSIONS"
+    if not drive_object.get("path"):
+        return False, "missing path"
+    return True, ""
 
 
 def parse_date_safe(date_header):
@@ -246,7 +384,7 @@ def list_message_ids(service, query):
 
 
 def fetch_raw_email(service, msg_id):
-    """Returns (raw_bytes, parsed_date, subject_safe, from_safe)."""
+    """Returns (raw_bytes, parsed_date, subject_safe, from_safe, subject_raw)."""
     msg = service.users().messages().get(
         userId="me",
         id=msg_id,
@@ -263,18 +401,26 @@ def fetch_raw_email(service, msg_id):
             headers[k.strip().lower()] = v.strip()
 
     parsed_date = parse_date_safe(headers.get("date", ""))
-    subject_safe = sanitize_for_filename(headers.get("subject", ""))
+    subject_raw = headers.get("subject", "")
+    subject_safe = (
+        sanitize_filename(subject_raw, max_len=80) if subject_raw else "no-subject"
+    )
     from_raw = headers.get("from", "")
     from_name = from_raw.split("<")[0].strip() or from_raw.strip() or "unknown-sender"
-    from_safe = sanitize_for_filename(from_name, 40)
-    return raw_bytes, parsed_date, subject_safe, from_safe
+    from_safe = sanitize_filename(from_name, max_len=40)
+    return raw_bytes, parsed_date, subject_safe, from_safe, subject_raw
 
 
-def build_filename(parsed_date, subject_safe, from_safe, msg_id):
-    return (
+def build_filename(parsed_date, subject_safe, from_safe, msg_id,
+                   mime_type="message/rfc822"):
+    """Build an AI-Drive-safe filename with a guaranteed-valid extension."""
+    base = (
         f"{parsed_date.strftime('%Y-%m-%d_%H%M')}_"
-        f"{from_safe}_{subject_safe}_{msg_id[:8]}.eml"
+        f"{from_safe}_{subject_safe}_{msg_id[:8]}"
     )
+    base = sanitize_filename(base, max_len=_MAX_FILENAME_BASE_LEN)
+    ext = normalize_extension(base, mime_type=mime_type)
+    return f"{base}{ext}"
 
 
 def build_folder_path(parsed_date):
@@ -469,11 +615,31 @@ def process_window(service, label_id, start_str, end_str):
     msg_ids = list(list_message_ids(service, query))
     log(f"  Found {len(msg_ids)} candidate email(s) in {start_str} – {end_str}")
 
-    successes, failures = 0, 0
+    successes, failures, skipped = 0, 0, 0
     batch = []  # list of dicts: msg_id, raw_bytes, drive_object, size_bytes, size_mb
 
     def flush_batch():
         nonlocal successes, failures
+        if not batch:
+            return
+
+        # Belt-and-braces: re-validate every drive_object inside the batch.
+        # The per-message loop already validates and skips invalid records,
+        # but this guard ensures we never send an unknown extension or
+        # invalid name to signed_url_upload_batch_v2 even if a future code
+        # path forgets the upfront check.
+        valid_items = []
+        for item in batch:
+            ok, reason = validate_drive_object(item["drive_object"])
+            if not ok:
+                log(
+                    "  Drop from batch msg_id=%s name=%r reason=%r"
+                    % (item["msg_id"], item["drive_object"].get("name"), reason)
+                )
+                failures += 1
+                continue
+            valid_items.append(item)
+        batch[:] = valid_items
         if not batch:
             return
 
@@ -543,25 +709,57 @@ def process_window(service, label_id, start_str, end_str):
 
     for i, msg_id in enumerate(msg_ids, start=1):
         try:
-            raw_bytes, parsed_date, subject_safe, from_safe = fetch_raw_email(
-                service, msg_id
+            raw_bytes, parsed_date, subject_safe, from_safe, subject_raw = (
+                fetch_raw_email(service, msg_id)
             )
         except Exception as e:
             log(f"  Error fetching {msg_id}: {e}")
             failures += 1
             continue
 
-        filename = build_filename(parsed_date, subject_safe, from_safe, msg_id)
+        # Emails are uploaded as RFC 822 .eml; record the MIME type for logs
+        # and so normalize_extension() has a sensible fallback.
+        mime_type = "message/rfc822"
+        original_filename = (
+            f"{subject_raw}.eml" if subject_raw else f"{msg_id[:8]}.eml"
+        )
+        filename = build_filename(
+            parsed_date, subject_safe, from_safe, msg_id, mime_type=mime_type
+        )
         folder_path = build_folder_path(parsed_date)
         size_bytes = len(raw_bytes)
         size_mb = size_bytes / (1024 * 1024)
+        final_ext = normalize_extension(filename, mime_type=mime_type)
 
         drive_object = {
             "name": filename,
             "path": folder_path,
             "isFile": True,
-            "file_type": "eml",
+            "file_type": final_ext.lstrip("."),
         }
+
+        # Validate the payload before sending it to signed_url_upload_batch_v2.
+        # Permanent rejections are skipped cleanly so AI Drive never sees an
+        # invalid payload and we never retry the same bad record.
+        is_valid, reason = validate_drive_object(drive_object)
+        if not is_valid:
+            skipped += 1
+            log(
+                "  Skip msg_id=%s reason=%r original=%r sanitized=%r "
+                "mime=%s ext=%s" % (
+                    msg_id, reason, original_filename, filename,
+                    mime_type, final_ext,
+                )
+            )
+            continue
+
+        if filename != original_filename:
+            log(
+                "  Sanitized msg_id=%s original=%r sanitized=%r "
+                "mime=%s ext=%s" % (
+                    msg_id, original_filename, filename, mime_type, final_ext,
+                )
+            )
 
         batch.append(
             {
@@ -579,10 +777,13 @@ def process_window(service, label_id, start_str, end_str):
         if i % 100 == 0:
             log(
                 f"  Progress: {i}/{len(msg_ids)} "
-                f"(successes: {successes}, failures: {failures})"
+                f"(successes: {successes}, failures: {failures}, "
+                f"skipped: {skipped})"
             )
 
     flush_batch()
+    if skipped:
+        log(f"  Skipped {skipped} message(s) due to validation failures")
     return successes, failures, len(msg_ids)
 
 
