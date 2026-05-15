@@ -1077,12 +1077,40 @@ def fetch_raw_email(service, msg_id):
 
 def build_filename(parsed_date, subject_safe, from_safe, msg_id,
                    mime_type="message/rfc822"):
-    """Build an AI-Drive-safe filename with a guaranteed-valid extension."""
-    base = (
-        f"{parsed_date.strftime('%Y-%m-%d_%H%M')}_"
-        f"{from_safe}_{subject_safe}_{msg_id[:8]}"
+    """Build an AI-Drive-safe filename with a guaranteed-valid extension.
+
+    The 8-char ``msg_id`` suffix is appended *after* the per-component
+    truncation so two different Gmail messages with similar long subjects
+    (very common for GitHub notification mail) never produce the same
+    sanitized name. AI Drive's batch endpoint rejects an entire batch when
+    any two files in it share a name, so preserving uniqueness here is what
+    keeps the upload from failing with HTTP 422 "Duplicate files in
+    request."
+    """
+    msg_suffix = f"_{msg_id}" if msg_id else ""
+    date_prefix = f"{parsed_date.strftime('%Y-%m-%d_%H%M')}_"
+    # Reserve room for the date prefix, the from/subject separator, and the
+    # always-on msg_id suffix so truncation can never strip the suffix off.
+    fixed_overhead = len(date_prefix) + 1 + len(msg_suffix)  # 1 = "_" between from and subject
+    body_budget = max(_MAX_FILENAME_BASE_LEN - fixed_overhead, 16)
+    # Split the remaining budget between sender and subject; favour subject
+    # since it carries the most disambiguating signal.
+    from_budget = min(len(from_safe), max(body_budget // 3, 16))
+    subject_budget = max(body_budget - from_budget - 1, 8)  # 1 = "_" between from and subject
+    from_trunc = sanitize_filename(from_safe, max_len=from_budget)
+    subject_trunc = sanitize_filename(subject_safe, max_len=subject_budget)
+    base = sanitize_filename(
+        f"{date_prefix}{from_trunc}_{subject_trunc}{msg_suffix}",
+        max_len=_MAX_FILENAME_BASE_LEN,
     )
-    base = sanitize_filename(base, max_len=_MAX_FILENAME_BASE_LEN)
+    # Final safety net: if sanitisation somehow stripped the suffix (e.g.
+    # the msg_id contained only chars sanitize_filename collapses), append
+    # it back so uniqueness is guaranteed.
+    if msg_suffix and not base.endswith(msg_suffix):
+        base = sanitize_filename(
+            base[: _MAX_FILENAME_BASE_LEN - len(msg_suffix)] + msg_suffix,
+            max_len=_MAX_FILENAME_BASE_LEN,
+        )
     ext = normalize_extension(base, mime_type=mime_type)
     return f"{base}{ext}"
 
@@ -1674,6 +1702,37 @@ def process_window(service, label_id, start_str, end_str):
                 continue
             valid_items.append(item)
         batch[:] = valid_items
+        if not batch:
+            return
+
+        # Defensive in-batch dedup by (path, name). AI Drive's
+        # signed_url_upload_batch_v2 rejects the *entire* batch with
+        # HTTP 422 "Duplicate files in request." if any two drive_objects
+        # share path+name, so a single accidental collision (e.g. two
+        # Gmail messages whose sanitized filenames happen to match, or a
+        # duplicate msg_id yielded across paginated list calls) would
+        # otherwise drop ~25 uploads. Drop the extras here instead.
+        seen_keys = set()
+        deduped = []
+        for item in batch:
+            key = (
+                item["drive_object"].get("path"),
+                item["drive_object"].get("name"),
+            )
+            if key in seen_keys:
+                log(
+                    "  Drop from batch msg_id=%s name=%r reason=%r"
+                    % (
+                        item["msg_id"],
+                        item["drive_object"].get("name"),
+                        "duplicate-in-batch",
+                    )
+                )
+                failures += 1
+                continue
+            seen_keys.add(key)
+            deduped.append(item)
+        batch[:] = deduped
         if not batch:
             return
 
