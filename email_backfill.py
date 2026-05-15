@@ -1079,24 +1079,25 @@ def build_filename(parsed_date, subject_safe, from_safe, msg_id,
                    mime_type="message/rfc822"):
     """Build an AI-Drive-safe filename with a guaranteed-valid extension.
 
-    The 8-char ``msg_id`` suffix is appended *after* the per-component
-    truncation so two different Gmail messages with similar long subjects
-    (very common for GitHub notification mail) never produce the same
-    sanitized name. AI Drive's batch endpoint rejects an entire batch when
-    any two files in it share a name, so preserving uniqueness here is what
-    keeps the upload from failing with HTTP 422 "Duplicate files in
-    request."
+    The full ``msg_id`` is appended *after* the per-component truncation so
+    two different Gmail messages with similar long subjects (very common
+    for GitHub notification mail) never produce the same sanitized name.
+    AI Drive's batch endpoint rejects an entire batch when any two files
+    in it share a name, so preserving uniqueness here is what keeps the
+    upload from failing with HTTP 422 "Duplicate files in request."
     """
     msg_suffix = f"_{msg_id}" if msg_id else ""
     date_prefix = f"{parsed_date.strftime('%Y-%m-%d_%H%M')}_"
-    # Reserve room for the date prefix, the from/subject separator, and the
-    # always-on msg_id suffix so truncation can never strip the suffix off.
-    fixed_overhead = len(date_prefix) + 1 + len(msg_suffix)  # 1 = "_" between from and subject
+    # fixed_overhead = date prefix (with trailing "_") + the explicit "_"
+    # between from and subject + the always-on msg_id suffix (which itself
+    # carries a leading "_"). What's left of _MAX_FILENAME_BASE_LEN is the
+    # joint budget for from + subject.
+    fixed_overhead = len(date_prefix) + 1 + len(msg_suffix)
     body_budget = max(_MAX_FILENAME_BASE_LEN - fixed_overhead, 16)
     # Split the remaining budget between sender and subject; favour subject
     # since it carries the most disambiguating signal.
     from_budget = min(len(from_safe), max(body_budget // 3, 16))
-    subject_budget = max(body_budget - from_budget - 1, 8)  # 1 = "_" between from and subject
+    subject_budget = max(body_budget - from_budget, 8)
     from_trunc = sanitize_filename(from_safe, max_len=from_budget)
     subject_trunc = sanitize_filename(subject_safe, max_len=subject_budget)
     base = sanitize_filename(
