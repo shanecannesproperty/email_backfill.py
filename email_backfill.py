@@ -33,12 +33,28 @@ OPERATING MODES (set via RUN_MODE environment variable):
 
 ENVIRONMENT VARIABLES:
 
-  AIDRIVE_TOKEN                your AI Drive API token (Bearer JWT). May expire;
-                               see AIDRIVE_TOKEN_FILE for live-reload support.
-  AIDRIVE_TOKEN_FILE           (optional) path to a file containing the AI Drive
-                               JWT. When set, the token is reloaded from this
-                               file before every API request, so a new JWT can
-                               be dropped in place mid-run without restarting.
+  AIDRIVE_REFRESH_TOKEN        (preferred) Firebase refresh token for the
+                               AI Drive account. Read from the browser
+                               localStorage entry
+                               ``firebase:authUser:<apiKey>:[DEFAULT]`` →
+                               ``stsTokenManager.refreshToken``. When this and
+                               AIDRIVE_FIREBASE_API_KEY are both set, the
+                               uploader mints fresh JWTs automatically and no
+                               longer depends on a manually-pasted
+                               AIDRIVE_TOKEN.
+  AIDRIVE_FIREBASE_API_KEY     (preferred) Firebase Web API key. Read from the
+                               same localStorage entry → ``apiKey``, e.g.
+                               ``AIzaSy...``.
+  AIDRIVE_TOKEN                (optional fallback) AI Drive bearer JWT pasted
+                               from a logged-in browser session. Used only if
+                               the Firebase refresh credentials above are not
+                               set. Short-lived; will be retired automatically
+                               once a Firebase refresh succeeds.
+  AIDRIVE_TOKEN_FILE           (optional fallback) path to a file containing
+                               the AI Drive JWT. When set, the token is
+                               reloaded from this file before every API
+                               request, so a new JWT can be dropped in place
+                               mid-run without restarting.
   AIDRIVE_FOLDER               destination folder, e.g. "04 - EMAIL ARCHIVE"
   GMAIL_CLIENT_ID              OAuth client id from Google Cloud Console
   GMAIL_CLIENT_SECRET          OAuth client secret
@@ -100,11 +116,25 @@ def _require_env(name):
 
 
 AIDRIVE_TOKEN_FILE = os.environ.get("AIDRIVE_TOKEN_FILE", "").strip()
-# Validate AIDRIVE_TOKEN at startup so misconfiguration fails fast, but DO NOT
-# cache the value for the rest of the run — the token is reloaded from the
-# environment (and AIDRIVE_TOKEN_FILE if set) on every API request so an
-# operator can drop in a refreshed JWT mid-run without restarting.
-_require_env("AIDRIVE_TOKEN")
+# Firebase auto-refresh credentials (preferred). When both are set, the
+# uploader mints fresh AI Drive JWTs on demand via Google Identity Toolkit's
+# secure-token endpoint, so long-running historical backfills never have to
+# stop for a manually-pasted token.
+AIDRIVE_REFRESH_TOKEN = os.environ.get("AIDRIVE_REFRESH_TOKEN", "").strip()
+AIDRIVE_FIREBASE_API_KEY = os.environ.get("AIDRIVE_FIREBASE_API_KEY", "").strip()
+# Optional manual fallback. Only required when Firebase refresh credentials
+# are not configured — otherwise it acts as a last-resort token until the
+# first successful refresh.
+_AIDRIVE_TOKEN_ENV = os.environ.get("AIDRIVE_TOKEN", "").strip()
+if not (AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY) \
+        and not _AIDRIVE_TOKEN_ENV \
+        and not AIDRIVE_TOKEN_FILE:
+    raise RuntimeError(
+        "Missing AI Drive credentials: set AIDRIVE_REFRESH_TOKEN + "
+        "AIDRIVE_FIREBASE_API_KEY (preferred, enables auto-refresh) or, "
+        "as a fallback, AIDRIVE_TOKEN / AIDRIVE_TOKEN_FILE. "
+        "Check your GitHub Actions secrets configuration."
+    )
 AIDRIVE_FOLDER = os.environ.get("AIDRIVE_FOLDER", "04 - EMAIL ARCHIVE")
 GMAIL_CLIENT_ID = _require_env("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = _require_env("GMAIL_CLIENT_SECRET")
@@ -176,17 +206,39 @@ def _looks_like_auth_failure(status, body):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic AI Drive token loading
+# Dynamic AI Drive token loading + Firebase auto-refresh
 # ---------------------------------------------------------------------------
 #
-# Bearer JWTs minted from the AI Drive browser session expire after a few
-# hours, which is shorter than a full historical backfill can take. Reading
-# the token from the environment once at startup means an expired JWT cannot
-# be replaced without restarting the process and losing progress. Instead we
-# reload the token before every request, optionally from an external file
-# (AIDRIVE_TOKEN_FILE) that an operator can update while the script runs.
+# Bearer JWTs minted from the AI Drive (Firebase) browser session expire
+# after roughly an hour, which is shorter than a full historical backfill
+# can take. To avoid stopping mid-run for a manually-pasted token we mint
+# fresh JWTs on demand using Firebase's secure-token endpoint:
+#
+#   POST https://securetoken.googleapis.com/v1/token?key=<API_KEY>
+#   form-encoded: grant_type=refresh_token & refresh_token=<REFRESH_TOKEN>
+#
+# The response carries access_token / id_token / expires_in / user_id; we
+# use id_token as the AI Drive ``Authorization: Bearer …`` value and refresh
+# proactively when the cached JWT is within FIREBASE_REFRESH_SKEW_SECS of
+# expiry (or reactively after an AUTH_REQUIRED / 401 response).
+#
+# The ``AIDRIVE_TOKEN`` / ``AIDRIVE_TOKEN_FILE`` mechanisms are kept as a
+# manual fallback for environments that have not (yet) been configured with
+# the Firebase refresh credentials.
 
-_aidrive_token_cache = {"value": None, "source": None}
+FIREBASE_SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+# Refresh slightly before the JWT actually expires so an in-flight request
+# never lands with a token that's about to die.
+FIREBASE_REFRESH_SKEW_SECS = 120
+# Hard cap on consecutive Firebase-refresh attempts before giving up. Stops
+# the process from busy-looping if the refresh token itself is revoked.
+FIREBASE_REFRESH_MAX_ATTEMPTS = 3
+
+_aidrive_token_cache = {
+    "value": None,        # current bearer JWT (id_token)
+    "source": None,       # "firebase" | "file:…" | "env:AIDRIVE_TOKEN"
+    "expires_at": None,   # epoch seconds, or None if unknown
+}
 
 
 def _read_token_file(path):
@@ -200,55 +252,303 @@ def _read_token_file(path):
         return ""
 
 
-def get_aidrive_token():
-    """Return the current AI Drive Bearer JWT.
+def _decode_jwt_exp(token):
+    """Return the JWT ``exp`` claim (epoch seconds) or ``None`` on failure.
 
-    Lookup order:
-      1. ``AIDRIVE_TOKEN_FILE`` (if set and non-empty contents)
-      2. ``AIDRIVE_TOKEN`` environment variable
-
-    The value is re-read on every call. A short structured log line is
-    emitted whenever the resolved token changes, so token reloads are
-    traceable in run logs (without ever logging the token itself).
+    Used so manually-pasted tokens (without an explicit expires_in from the
+    refresh endpoint) can still participate in proactive expiry detection.
+    Decoding is best-effort and never validates the signature — we just need
+    the unsigned ``exp`` claim for scheduling.
     """
-    token = ""
-    source = None
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        payload_b64 = token.split(".")[1]
+        # JWT uses URL-safe base64 without padding.
+        padding = "=" * (-len(payload_b64) % 4)
+        raw = base64.urlsafe_b64decode(payload_b64 + padding)
+        claims = json.loads(raw.decode("utf-8", errors="ignore"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    exp = claims.get("exp")
+    return int(exp) if isinstance(exp, (int, float)) else None
+
+
+def is_token_expired(expires_at=None, skew=FIREBASE_REFRESH_SKEW_SECS):
+    """Return True when the cached token has expired (or will, within skew).
+
+    Treats an unknown ``expires_at`` as "expired" so the caller refreshes —
+    this is the safe default when we have no idea how long a manually pasted
+    token has left.
+    """
+    if expires_at is None:
+        return True
+    return time.time() + skew >= expires_at
+
+
+def _redact(value, keep=4):
+    """Return a short, non-sensitive marker for secret values.
+
+    Never returns enough characters to reconstruct the secret. Used only in
+    structured log lines so operators can correlate refresh events without
+    leaking the JWT itself.
+    """
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return "<redacted>"
+    return f"<redacted len={len(value)}>"
+
+
+def refresh_firebase_token():
+    """Mint a fresh AI Drive JWT via Firebase's secure-token endpoint.
+
+    Updates the in-memory token cache on success and returns the new
+    ``id_token``. Raises :class:`AIDriveAuthExpired` if the refresh token
+    is rejected (HTTP 400 ``INVALID_REFRESH_TOKEN`` /
+    ``TOKEN_EXPIRED`` / ``USER_DISABLED`` etc.) so the caller can stop
+    cleanly. Network / 5xx errors raise ``RuntimeError`` so the surrounding
+    retry classifier can treat them as transient.
+    """
+    if not (AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY):
+        raise AIDriveAuthExpired(
+            "Firebase refresh credentials are not configured "
+            "(set AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY)."
+        )
+    last_err = None
+    for attempt in range(FIREBASE_REFRESH_MAX_ATTEMPTS):
+        try:
+            r = requests.post(
+                FIREBASE_SECURE_TOKEN_URL,
+                params={"key": AIDRIVE_FIREBASE_API_KEY},
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": AIDRIVE_REFRESH_TOKEN,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                timeout=REQUEST_TIMEOUT_SECS,
+            )
+        except _TRANSIENT_NETWORK_EXCEPTIONS as e:
+            last_err = f"network error: {type(e).__name__}: {e}"
+            log(
+                "event=firebase_refresh attempt=%d classification=transient "
+                "reason=network_error" % (attempt + 1)
+            )
+            time.sleep(RETRY_DELAY_SECS)
+            continue
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Firebase refresh transport error: {type(e).__name__}: {e}"
+            ) from e
+
+        if r.status_code == 200:
+            try:
+                payload = r.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Firebase refresh returned non-JSON body: {e}"
+                ) from e
+            id_token = (payload.get("id_token") or "").strip()
+            access_token = (payload.get("access_token") or "").strip()
+            user_id = payload.get("user_id") or ""
+            try:
+                expires_in = int(payload.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                expires_in = 0
+            # Prefer id_token (Firebase ID JWT) for AI Drive's
+            # ``Authorization: Bearer …`` header. Fall back to access_token
+            # if the response shape ever differs; both are JWTs minted by
+            # the same secure-token service.
+            new_token = id_token or access_token
+            if not new_token:
+                raise AIDriveAuthExpired(
+                    "Firebase refresh succeeded but returned no id_token / "
+                    "access_token — check AIDRIVE_FIREBASE_API_KEY."
+                )
+            jwt_exp = _decode_jwt_exp(new_token)
+            now = time.time()
+            if expires_in > 0:
+                expires_at = now + expires_in
+            elif jwt_exp:
+                expires_at = float(jwt_exp)
+            else:
+                # Conservative default: assume 50 minutes if neither hint
+                # is available so we still refresh proactively.
+                expires_at = now + 50 * 60
+            old = _aidrive_token_cache.get("value")
+            _aidrive_token_cache.update(
+                {
+                    "value": new_token,
+                    "source": "firebase",
+                    "expires_at": expires_at,
+                }
+            )
+            ttl = max(0, int(expires_at - now))
+            log(
+                "event=firebase_refresh status=ok user_id=%s ttl_secs=%d "
+                "rotated=%s token=%s"
+                % (
+                    user_id or "<unknown>",
+                    ttl,
+                    "true" if old and old != new_token else "false",
+                    _redact(new_token),
+                )
+            )
+            return new_token
+
+        # Non-200 — classify.
+        body = r.text or ""
+        last_err = f"HTTP {r.status_code} {body[:200]}"
+        body_lower = body.lower()
+        permanent_markers = (
+            "invalid_refresh_token",
+            "token_expired",
+            "user_disabled",
+            "user_not_found",
+            "invalid_grant",
+        )
+        is_permanent = (
+            r.status_code in (400, 401, 403)
+            and any(m in body_lower for m in permanent_markers)
+        )
+        if is_permanent:
+            log(
+                f"event=firebase_refresh status=rejected "
+                f"http={r.status_code} reason=permanent"
+            )
+            raise AIDriveAuthExpired(
+                f"Firebase refresh token rejected ({last_err}). "
+                "Re-extract AIDRIVE_REFRESH_TOKEN from the browser "
+                "(localStorage → firebase:authUser:<apiKey>:[DEFAULT] → "
+                "stsTokenManager.refreshToken)."
+            )
+        if r.status_code in _TRANSIENT_RETRY_STATUSES:
+            log(
+                f"event=firebase_refresh attempt={attempt + 1} "
+                f"classification=transient http={r.status_code}"
+            )
+            time.sleep(RETRY_DELAY_SECS)
+            continue
+        # Other 4xx: surface as a hard runtime error so the retry classifier
+        # in the caller doesn't loop on a misconfiguration (e.g. wrong
+        # API key shape).
+        log(
+            f"event=firebase_refresh status=failed http={r.status_code} "
+            f"classification=permanent"
+        )
+        raise RuntimeError(f"Firebase refresh failed: {last_err}")
+    raise RuntimeError(
+        f"Firebase refresh failed after {FIREBASE_REFRESH_MAX_ATTEMPTS} "
+        f"attempts: {last_err}"
+    )
+
+
+def _load_fallback_token():
+    """Return ``(token, source)`` from AIDRIVE_TOKEN_FILE / AIDRIVE_TOKEN."""
     if AIDRIVE_TOKEN_FILE:
         token = _read_token_file(AIDRIVE_TOKEN_FILE)
         if token:
-            source = f"file:{AIDRIVE_TOKEN_FILE}"
-    if not token:
-        token = os.environ.get("AIDRIVE_TOKEN", "").strip()
-        if token:
-            source = "env:AIDRIVE_TOKEN"
+            return token, f"file:{AIDRIVE_TOKEN_FILE}"
+    token = os.environ.get("AIDRIVE_TOKEN", "").strip()
+    if token:
+        return token, "env:AIDRIVE_TOKEN"
+    return "", None
+
+
+def get_aidrive_token():
+    """Return a usable AI Drive bearer JWT.
+
+    Resolution order:
+
+    1. Cached Firebase-refreshed JWT, if still valid (proactive expiry).
+    2. Mint a fresh JWT via :func:`refresh_firebase_token` when refresh
+       credentials are configured.
+    3. Cached non-Firebase token if it has not changed.
+    4. ``AIDRIVE_TOKEN_FILE`` then ``AIDRIVE_TOKEN`` (manual fallback).
+
+    The token is held in memory only — it is never written to disk and
+    never logged in full. A structured ``event=token_*`` line is emitted
+    whenever the resolved token changes so refresh activity is traceable.
+    """
+    cached_value = _aidrive_token_cache.get("value")
+    cached_source = _aidrive_token_cache.get("source")
+    cached_exp = _aidrive_token_cache.get("expires_at")
+
+    # 1. Reuse cached Firebase-minted token while it's still good.
+    if (
+        cached_value
+        and cached_source == "firebase"
+        and not is_token_expired(cached_exp)
+    ):
+        return cached_value
+
+    # 2. Prefer Firebase auto-refresh when configured.
+    if AIDRIVE_REFRESH_TOKEN and AIDRIVE_FIREBASE_API_KEY:
+        if cached_value and cached_source == "firebase":
+            log(
+                "event=token_refresh_due reason=expired_or_near_expiry "
+                "source=firebase"
+            )
+        return refresh_firebase_token()
+
+    # 3 + 4. Manual fallback — keep prior behaviour.
+    token, source = _load_fallback_token()
     if not token:
         raise AIDriveAuthExpired(
-            "AI Drive JWT is not available — set AIDRIVE_TOKEN "
-            "or populate AIDRIVE_TOKEN_FILE."
+            "AI Drive JWT is not available — set AIDRIVE_REFRESH_TOKEN + "
+            "AIDRIVE_FIREBASE_API_KEY (preferred) or AIDRIVE_TOKEN / "
+            "AIDRIVE_TOKEN_FILE."
         )
-    cached = _aidrive_token_cache["value"]
-    if cached != token:
-        if cached is None:
+    if cached_value != token:
+        if cached_value is None:
             log(f"event=token_loaded source={source}")
         else:
             log(
                 f"event=token_reloaded source={source} "
                 f"reason=value_changed"
             )
-        _aidrive_token_cache["value"] = token
-        _aidrive_token_cache["source"] = source
+        # Best-effort expiry from the JWT itself so we still know when to
+        # treat the manual token as stale.
+        exp_claim = _decode_jwt_exp(token)
+        _aidrive_token_cache.update(
+            {
+                "value": token,
+                "source": source,
+                "expires_at": float(exp_claim) if exp_claim else None,
+            }
+        )
     return token
 
 
-def force_reload_aidrive_token():
-    """Drop the cached token so the next get_aidrive_token() re-reads sources.
+def get_valid_aidrive_token():
+    """Return a token guaranteed not to be near expiry.
 
-    Returns ``(old_token, new_token)``. Used after an auth failure to detect
-    whether the operator (or an external rotator) has supplied a fresh JWT
-    while the process was running.
+    Convenience wrapper that proactively refreshes the cached token when
+    it is within the refresh skew window. Equivalent to calling
+    :func:`get_aidrive_token` plus an explicit expiry check, exposed as a
+    distinct helper so callers (and tests) can document the proactive
+    intent explicitly.
     """
-    old_token = _aidrive_token_cache["value"]
-    _aidrive_token_cache["value"] = None
+    cached_value = _aidrive_token_cache.get("value")
+    cached_exp = _aidrive_token_cache.get("expires_at")
+    if cached_value and not is_token_expired(cached_exp):
+        return cached_value
+    return get_aidrive_token()
+
+
+def force_reload_aidrive_token():
+    """Drop the cached token and re-resolve.
+
+    Returns ``(old_token, new_token)``. Used after an AI Drive AUTH_REQUIRED
+    response: with Firebase credentials this triggers a fresh refresh;
+    without them it re-reads ``AIDRIVE_TOKEN_FILE`` / ``AIDRIVE_TOKEN`` so
+    an operator can swap in a new manually-pasted JWT mid-run.
+    """
+    old_token = _aidrive_token_cache.get("value")
+    _aidrive_token_cache.update({"value": None, "expires_at": None})
     try:
         new_token = get_aidrive_token()
     except AIDriveAuthExpired:
@@ -578,8 +878,14 @@ def build_folder_path(parsed_date):
 
 
 def aidrive_headers():
+    """Return AI Drive request headers with a guaranteed-valid bearer JWT.
+
+    Uses :func:`get_valid_aidrive_token` so a near-expiry token is refreshed
+    proactively (via Firebase when configured) before the request goes out,
+    rather than waiting for an AUTH_REQUIRED response.
+    """
     return {
-        "Authorization": f"Bearer {get_aidrive_token()}",
+        "Authorization": f"Bearer {get_valid_aidrive_token()}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -650,23 +956,28 @@ def _post_with_retries(url, json_body, label):
         if _looks_like_auth_failure(status, body):
             log(
                 f"{label} attempt {attempt + 1} classification=auth_failure "
-                f"status={status} body={body[:120]!r}"
+                f"status={status}"
             )
             if not auth_reload_attempted:
                 auth_reload_attempted = True
-                old_tok, new_tok = force_reload_aidrive_token()
+                try:
+                    old_tok, new_tok = force_reload_aidrive_token()
+                except AIDriveAuthExpired:
+                    old_tok, new_tok = _aidrive_token_cache.get("value"), None
                 if new_tok and new_tok != old_tok:
                     log(
-                        f"event=auth_recovery action=token_reloaded "
-                        f"label={label} — retrying once with refreshed JWT"
+                        f"event=auth_recovery action=token_refreshed "
+                        f"label={label} source={_aidrive_token_cache.get('source')} "
+                        "— retrying once with refreshed JWT"
                     )
                     continue
                 log(
-                    "event=auth_failure action=give_up reason=token_unchanged "
+                    "event=auth_failure action=give_up "
+                    "reason=refresh_did_not_yield_new_token "
                     f"label={label}"
                 )
             raise AIDriveAuthExpired(
-                f"AI Drive JWT expired — refresh required ({label}: {last_err})"
+                f"AI Drive JWT expired — refresh required ({label}: HTTP {status})"
             )
 
         if status in _TRANSIENT_RETRY_STATUSES:

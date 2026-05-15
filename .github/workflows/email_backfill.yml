@@ -54,6 +54,13 @@ jobs:
 
       - name: Run email backfill
         env:
+          # Preferred: Firebase auto-refresh credentials. When both are set
+          # the uploader mints fresh AI Drive JWTs on demand and never
+          # stops mid-run for a manually-pasted token.
+          AIDRIVE_REFRESH_TOKEN: ${{ secrets.AIDRIVE_REFRESH_TOKEN }}
+          AIDRIVE_FIREBASE_API_KEY: ${{ secrets.AIDRIVE_FIREBASE_API_KEY }}
+          # Fallback: short-lived bearer JWT. Only used when the two
+          # secrets above are not configured.
           AIDRIVE_TOKEN: ${{ secrets.AIDRIVE_TOKEN }}
           AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
