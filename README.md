@@ -1,7 +1,8 @@
 # email_backfill.py
 
 Automatically syncs Gmail messages into [My AI Drive](https://myaidrive.com) as
-individual `.eml` files using the AI Drive signed-URL upload API.
+individual `.txt` files (with attachments uploaded separately when their format
+is supported) using the AI Drive signed-URL upload API.
 
 The script runs unattended in **GitHub Actions** on a **30-minute schedule**
 and can also be triggered manually for a full 12-month historical catch-up.
@@ -105,12 +106,20 @@ For a one-off import of a specific period:
 
 ## Attachments
 
-**Attachments are automatically included.** Gmail's `raw` format returns the
-complete [RFC 822](https://www.rfc-editor.org/rfc/rfc822) message bytes, which
-contain the full MIME structure — body text, HTML alternative, and every
-attachment — all in a single binary blob. The script uploads this blob as a
-`.eml` file, so AI Drive receives the entire message including attachments.
-No separate handling is needed.
+Gmail's `raw` format returns the complete
+[RFC 822](https://www.rfc-editor.org/rfc/rfc822) message bytes, which contain
+the full MIME structure — body text, HTML alternative, and every attachment.
+
+Because **AI Drive rejects `.eml` / `message/rfc822` uploads with HTTP 422**,
+the script converts each email into a UTF-8 plain-text rendering before
+uploading. The text version preserves the key headers (`From`, `To`, `Date`,
+`Subject`, `Message-ID`) followed by the message body.
+
+Attachments whose extension is in the AI Drive allow-list (`.pdf`, `.csv`,
+`.xlsx`, `.xls`, `.docx`, `.doc`, `.pptx`, `.ppt`, `.txt`, `.md`) are queued
+as **separate uploads** alongside the email text, so they remain accessible in
+their native form. Attachments with unsupported extensions (images, archives,
+etc.) are skipped — they remain visible inside Gmail.
 
 ## How it works
 
@@ -122,11 +131,13 @@ No separate handling is needed.
    - **custom** — uses the supplied `START_DATE` / `END_DATE` directly.
 3. For each window, lists message ids matching
    `after:START before:END -label:aidrive-archived`, capped at `MAX_EMAILS`.
-4. For each message, fetches the raw RFC 822 bytes (includes attachments) and
-   builds a filename: `YYYY-MM-DD_HHMM_<from>_<subject>_<msgid8>.eml`.
+4. For each message, fetches the raw RFC 822 bytes (includes attachments),
+   renders it as plain text, and builds a filename:
+   `YYYY-MM-DD_HHMM_<from>_<subject>_<msgid8>.txt`. Supported attachments are
+   queued as additional `<...>-att<N>.<ext>` uploads in the same batch.
 5. In batches of 25, requests signed upload URLs from
    `POST /signed_url_upload_batch_v2`.
-6. PUTs each `.eml` to the returned signed GCS URL.
+6. PUTs each rendered text (or attachment) blob to the returned signed GCS URL.
 7. **Labels the message in Gmail immediately on successful PUT** — this
    guarantees a rerun cannot upload the same bytes twice, even if the
    subsequent registration call fails.
