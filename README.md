@@ -126,8 +126,15 @@ No separate handling is needed.
 
 ### Failure handling and reruns
 
-* All AI Drive API calls and GCS PUTs are retried up to 3 times with a
-  5-second backoff. Network errors are treated as retryable.
+* **Retry classification** — Only transient failures are retried (HTTP 408 /
+  429 / 5xx, connection resets, read/connect timeouts). Permanent failures
+  fail fast and are never retried:
+  - HTTP 401 / `AUTH_REQUIRED` / "invalid token" → treated as expired JWT,
+    see [AI Drive JWT expiration](#ai-drive-jwt-expiration--refresh) below.
+  - Other 4xx (validation errors, invalid payload, unsupported file type) →
+    the offending record is skipped and counted as a failure; retrying would
+    just produce the same error.
+* All retried calls back off 5 seconds between attempts (up to 3 attempts).
 * If `signed_url_upload_batch_v2` returns a different number of entries than
   requested, the entire batch is failed (no silent drops).
 * If a GCS upload succeeds but registration fails, the message is still
@@ -135,7 +142,79 @@ No separate handling is needed.
   the bytes**; instead you should investigate the registration failure
   in the run log and re-register manually if needed.
 * The job exits with a non-zero status if any failures occurred so the
-  workflow run is marked red.
+  workflow run is marked red. **Exit code 2 is reserved** for clean
+  termination after an expired JWT — see below.
+
+## AI Drive JWT expiration & refresh
+
+`AIDRIVE_TOKEN` is a Bearer JWT copied from a logged-in AI Drive browser
+session. **These tokens expire periodically** (typically every few hours),
+which is shorter than a full historical backfill can run. The script
+detects expiration and shuts down cleanly so you can refresh the token and
+resume without losing progress.
+
+### What expiration looks like
+
+When AI Drive responds with HTTP 401, an `AUTH_REQUIRED` error code, or any
+"invalid token" / "token expired" body, the script:
+
+1. Logs `AI Drive JWT expired — refresh required` (plus a structured
+   `event=auth_failure` line).
+2. Stops the current batch cleanly — no further upload attempts are made
+   with the dead token.
+3. Preserves the resumable checkpoint (see below) so completed monthly
+   chunks are not redone.
+4. Exits with **exit code 2** (distinct from ordinary failures, which use
+   exit code 1).
+
+### Refreshing the token from browser DevTools
+
+1. Open <https://myaidrive.com> in a browser and sign in.
+2. Open **DevTools → Network**.
+3. Trigger any action that calls the AI Drive API (e.g. open a folder).
+4. Click any request to `ai-drive-api-prod-…run.app`.
+5. In **Headers → Request Headers**, find `Authorization: Bearer <JWT>`.
+6. Copy the JWT value (everything after `Bearer `, no quotes).
+
+### Replacing the token
+
+* **Local run with `.env`** — open `.env`, replace the value of
+  `AIDRIVE_TOKEN`, save, and re-run. Never commit `.env`.
+* **GitHub Actions** — go to **Settings → Secrets and variables → Actions**
+  and update the `AIDRIVE_TOKEN` secret. The next workflow run will pick
+  it up automatically.
+* **Hot-swap mid-run (optional)** — set `AIDRIVE_TOKEN_FILE=/path/to/token`
+  in the environment instead of (or in addition to) `AIDRIVE_TOKEN`. The
+  script re-reads that file before every API request, so an operator (or
+  an external token rotator) can drop in a fresh JWT while the process is
+  running and the very next request will use it. The file must contain
+  only the raw token — no `Bearer ` prefix, no surrounding quotes.
+
+> ⚠️ **Never commit `.env`, `AIDRIVE_TOKEN`, or any token file.** Both
+> `.env` and `*.checkpoint.json` are listed in `.gitignore`, but the
+> external token-file path you choose for `AIDRIVE_TOKEN_FILE` must also
+> live outside the repository (e.g. under `/run/secrets/` or a path you
+> add to `.gitignore`).
+
+## Resumable historical imports
+
+Historical backfills can take a long time and can be interrupted by an
+expired JWT, a network outage, GitHub Actions cancellation, or a manual
+stop. The script writes a small JSON checkpoint file after every monthly
+chunk that completes successfully, and **skips already-completed chunks
+on the next run**:
+
+* Default path: `.backfill_checkpoint.json` in the working directory.
+* Override with the `CHECKPOINT_FILE` environment variable.
+* The file contains only the list of completed `(start, end)` chunk keys
+  plus a saved-at timestamp — no message data, no credentials.
+* Writes are atomic (temp file + rename + `fsync`) so a crash mid-write
+  cannot corrupt the file. A corrupt or unreadable checkpoint is ignored
+  and treated as an empty resume state.
+* The checkpoint is gitignored — never commit it.
+
+To start a historical backfill from scratch, simply delete the checkpoint
+file before triggering the run.
 
 ### Required configuration assumptions
 
@@ -170,11 +249,15 @@ python email_backfill.py
 ```
 
 > **⚠️ Warning:** `AIDRIVE_TOKEN` is a Bearer JWT copied from your AI Drive
-> browser session. It **may expire** — if AI Drive API calls start failing
-> with HTTP 401/403, refresh the token from the browser and update
-> `.env` (locally) or the `AIDRIVE_TOKEN` GitHub Actions secret.
-> **Never commit `.env` or the raw token** — `.env` is already listed in
-> `.gitignore`.
+> browser session and **expires periodically**. If AI Drive API calls start
+> failing with HTTP 401 / `AUTH_REQUIRED` / "invalid token", the script
+> logs `AI Drive JWT expired — refresh required`, preserves any
+> historical-mode progress in `.backfill_checkpoint.json`, and exits with
+> code 2. See [AI Drive JWT expiration & refresh](#ai-drive-jwt-expiration--refresh)
+> for the refresh procedure (browser DevTools → update `.env` or the
+> `AIDRIVE_TOKEN` GitHub Actions secret → re-run).
+> **Never commit `.env`, raw tokens, or the checkpoint file** — they are
+> already listed in `.gitignore`.
 
 Or, if you prefer plain shell exports:
 
