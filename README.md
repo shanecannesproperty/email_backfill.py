@@ -47,7 +47,7 @@ Add the following under **Settings → Secrets and variables → Actions**:
 
 | Secret | Description |
 | --- | --- |
-| `AIDRIVE_API_KEY` | API key for your AI Drive account. |
+| `AIDRIVE_TOKEN` | Bearer JWT for your AI Drive account (copy from your AI Drive browser session). |
 | `GMAIL_CLIENT_ID` | OAuth client id from step 2. |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth client secret from step 2. |
 | `GMAIL_REFRESH_TOKEN` | Refresh token from step 2. |
@@ -152,13 +152,35 @@ No separate handling is needed.
   `signed_url_upload_batch_v2` and `file_upload_status_v2`. Update
   `AIDRIVE_BASE` in `email_backfill.py` if your account uses a different
   region/host.
-* The Authorization scheme used by AI Drive is `Bearer <AIDRIVE_API_KEY>`.
+* The Authorization scheme used by AI Drive is `Bearer <AIDRIVE_TOKEN>`.
 
 ## Local execution
 
+For local runs, the recommended workflow is to use a `.env` file:
+
+```bash
+cp .env.example .env
+# Edit .env and paste your AI Drive Bearer JWT into AIDRIVE_TOKEN,
+# plus your Gmail OAuth values from `get_gmail_token.py`.
+pip install -r requirements.txt
+
+# Export the variables into your shell, then run:
+set -a; . ./.env; set +a
+python email_backfill.py
+```
+
+> **⚠️ Warning:** `AIDRIVE_TOKEN` is a Bearer JWT copied from your AI Drive
+> browser session. It **may expire** — if AI Drive API calls start failing
+> with HTTP 401/403, refresh the token from the browser and update
+> `.env` (locally) or the `AIDRIVE_TOKEN` GitHub Actions secret.
+> **Never commit `.env` or the raw token** — `.env` is already listed in
+> `.gitignore`.
+
+Or, if you prefer plain shell exports:
+
 ```bash
 pip install -r requirements.txt
-export AIDRIVE_API_KEY=...
+export AIDRIVE_TOKEN=...
 export GMAIL_CLIENT_ID=...
 export GMAIL_CLIENT_SECRET=...
 export GMAIL_REFRESH_TOKEN=...
@@ -191,7 +213,7 @@ python email_backfill.py
   is sufficient for typical mailbox sizes; very large mailboxes (100 k+ emails)
   may need to be split into smaller custom date-range runs.
 * **Scheduled runs require secrets** — If any of the four secrets
-  (`AIDRIVE_API_KEY`, `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+  (`AIDRIVE_TOKEN`, `GMAIL_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
   `GMAIL_REFRESH_TOKEN`) are missing or expired, scheduled runs will fail and
   show as red in the Actions tab. Renew the refresh token via `get_gmail_token.py`
   if Gmail authentication stops working.
