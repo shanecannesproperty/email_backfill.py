@@ -229,10 +229,10 @@ def get_aidrive_token():
     cached = _aidrive_token_cache["value"]
     if cached != token:
         if cached is None:
-            log(f"event=token_loaded source={source} length={len(token)}")
+            log(f"event=token_loaded source={source}")
         else:
             log(
-                f"event=token_reloaded source={source} length={len(token)} "
+                f"event=token_reloaded source={source} "
                 f"reason=value_changed"
             )
         _aidrive_token_cache["value"] = token
@@ -943,7 +943,7 @@ def save_checkpoint(completed_keys, path=None):
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "completed_chunks": sorted(completed_keys),
     }
-    directory = os.path.dirname(os.path.abspath(path)) or "."
+    directory = os.path.dirname(os.path.abspath(path))
     try:
         os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(

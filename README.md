@@ -148,7 +148,7 @@ No separate handling is needed.
 ## AI Drive JWT expiration & refresh
 
 `AIDRIVE_TOKEN` is a Bearer JWT copied from a logged-in AI Drive browser
-session. **These tokens expire periodically** (typically every few hours),
+session. **These tokens expire periodically** (often after several hours),
 which is shorter than a full historical backfill can run. The script
 detects expiration and shuts down cleanly so you can refresh the token and
 resume without losing progress.
