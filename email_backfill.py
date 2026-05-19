@@ -1,10 +1,6 @@
 """
 email_backfill.py
 
-Pulls emails from Gmail and uploads each one as a .txt file (raw RFC 822
-bytes) to AI Drive via the AI Drive API (signed-URL upload flow). The
-.txt extension is used because AI Drive's signed_url_upload_batch_v2
-endpoint does not accept .eml.
 Pulls emails from Gmail and uploads each one to AI Drive via the
 signed-URL upload flow.
 
@@ -22,10 +18,6 @@ UPLOAD FORMAT:
 
 ATTACHMENT HANDLING:
   Gmail's "raw" format returns the complete RFC 822 message bytes, which
-  includes all MIME parts (body text, HTML alternatives, and every attachment).
-  The script uploads those raw bytes as a .txt file, so attachments are
-  already embedded inside the payload. No separate attachment handling is
-  required.
   include every MIME part (body text, HTML alternative, and every
   attachment). Attachments whose extension is in the AI Drive allow-list
   (.pdf, .csv, .xlsx, .xls, .docx, .doc, .pptx, .ppt, .txt, .md) are
@@ -724,10 +716,6 @@ _CONTROL_WS_RE = re.compile(r"[\r\n\t\f\v\x00-\x1f]")
 # after the timestamp/sender/msg-id prefix is added.
 _MAX_FILENAME_BASE_LEN = 120
 
-# Extensions AI Drive accepts. ``.eml`` is NOT in this list — AI Drive's
-# ``signed_url_upload_batch_v2`` enum rejects it (HTTP 422). RFC 822 message
-# bodies are uploaded with a ``.txt`` extension instead (see
-# ``_MIME_TO_EXT`` below). Keep entries lowercase with the leading dot.
 # Extensions AI Drive accepts. ``.eml`` is intentionally NOT in this set:
 # AI Drive rejects ``message/rfc822`` / ``.eml`` uploads with HTTP 422. RFC
 # 822 messages must therefore be serialized to ``.txt`` before upload (see
@@ -1371,11 +1359,6 @@ def request_signed_urls(file_batch):
                     # AI Drive's enum requires the leading dot
                     # (e.g. ".pdf", ".txt"). Normalize defensively in case
                     # an upstream caller passes the bare extension.
-                    "file_type": (
-                        f["file_type"]
-                        if str(f["file_type"]).startswith(".")
-                        else f".{f['file_type']}"
-                    ),
                     "file_type": f["file_type"],
                 },
                 "size": f["size"],
@@ -1436,7 +1419,6 @@ def upload_to_gcs(signed_url_obj, raw_bytes, content_type="application/octet-str
     extra_headers = signed_url_obj.get("headers") or {}
     # Default Content-Type matches the file_type the signed URL was minted
     # for (.txt). Any Content-Type the signed-URL response specifies wins.
-    headers = {"Content-Type": "text/plain"}
     headers = {"Content-Type": content_type}
     headers.update(extra_headers)
     last_err = None
@@ -1662,11 +1644,6 @@ def save_checkpoint(completed_keys, path=None):
 def process_window(service, label_id, start_str, end_str):
     """Upload all unlabelled emails in [start_str, end_str) to AI Drive.
 
-    Returns (successes, failures, candidates) counts.
-    Emails are fetched as raw RFC 822 bytes and uploaded as ``.txt`` files
-    (AI Drive does not accept ``.eml``). The raw bytes still include the
-    full message body AND all attachments embedded in the MIME structure —
-    no separate attachment handling is needed.
     Returns (successes, failures, candidates) counts. Each Gmail message is
     rendered as plain text (``.txt``) before upload because AI Drive rejects
     ``.eml`` / ``message/rfc822``. Supported attachments (PDF, Office docs,
