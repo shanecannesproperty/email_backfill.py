@@ -115,6 +115,14 @@ RETRY_DELAY_SECS = 5
 REQUEST_TIMEOUT_SECS = 60
 UPLOAD_TIMEOUT_SECS = 120
 
+# Chunk-level / run-level retry settings. When auth or transient errors hit
+# mid-run the script waits with exponential backoff and retries rather than
+# stopping. This keeps a long historical backfill running unattended even
+# when the Firebase JWT refresh hits a transient hiccup.
+CHUNK_RETRY_MAX = 3
+CHUNK_RETRY_BASE_DELAY_SECS = 30
+CHUNK_RETRY_MAX_DELAY_SECS = 300
+
 # === Environment ===
 def _require_env(name):
     value = os.environ.get(name, "").strip()
@@ -1951,7 +1959,13 @@ def process_window(service, label_id, start_str, end_str):
 
 
 def _run_historical(service, label_id):
-    """Historical mode with resumable checkpoints."""
+    """Historical mode with resumable checkpoints.
+
+    Each chunk is retried up to CHUNK_RETRY_MAX times with exponential
+    backoff when auth or transient errors occur. On persistent failure
+    the chunk is skipped (left out of the checkpoint so the next run
+    re-attempts it) and processing continues with the next chunk.
+    """
     log(f"Folder: {AIDRIVE_FOLDER}. Per-chunk cap: {MAX_EMAILS}")
 
     chunks = list(_monthly_chunks(months_back=12))
@@ -1978,17 +1992,68 @@ def _run_historical(service, label_id):
             )
             continue
         log(f"\n[Chunk {idx}/{len(chunks)}] {start_str} → {end_str}")
-        s, f, c = process_window(service, label_id, start_str, end_str)
-        total_successes += s
-        total_failures += f
-        total_candidates += c
-        log(
-            f"[Chunk {idx}/{len(chunks)}] done — "
-            f"successes: {s}, failures: {f}, candidates: {c}"
-        )
-        # Persist progress immediately so a later failure cannot lose this chunk.
-        completed.add(key)
-        save_checkpoint(completed)
+
+        chunk_done = False
+        for attempt in range(CHUNK_RETRY_MAX + 1):
+            try:
+                s, f, c = process_window(service, label_id, start_str, end_str)
+                total_successes += s
+                total_failures += f
+                total_candidates += c
+                log(
+                    f"[Chunk {idx}/{len(chunks)}] done — "
+                    f"successes: {s}, failures: {f}, candidates: {c}"
+                )
+                # Persist progress so a later failure cannot lose this chunk.
+                completed.add(key)
+                save_checkpoint(completed)
+                chunk_done = True
+                break
+            except AIDriveAuthExpired as e:
+                if attempt >= CHUNK_RETRY_MAX:
+                    log(
+                        f"[Chunk {idx}/{len(chunks)}] auth failed after "
+                        f"{CHUNK_RETRY_MAX} retries: {e} — skipping chunk"
+                    )
+                    break
+                delay = min(
+                    CHUNK_RETRY_BASE_DELAY_SECS * (2 ** attempt),
+                    CHUNK_RETRY_MAX_DELAY_SECS,
+                )
+                log(
+                    f"[Chunk {idx}/{len(chunks)}] auth expired, refreshing "
+                    f"and retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{CHUNK_RETRY_MAX})"
+                )
+                time.sleep(delay)
+                _aidrive_token_cache.update(
+                    {"value": None, "expires_at": None}
+                )
+                try:
+                    service = get_gmail_service()
+                except Exception as gmail_err:
+                    log(f"  Gmail service refresh failed: {gmail_err}")
+            except Exception as e:
+                if attempt >= CHUNK_RETRY_MAX:
+                    log(
+                        f"[Chunk {idx}/{len(chunks)}] failed after "
+                        f"{CHUNK_RETRY_MAX} retries: {e} — skipping chunk"
+                    )
+                    break
+                delay = min(
+                    CHUNK_RETRY_BASE_DELAY_SECS * (2 ** attempt),
+                    CHUNK_RETRY_MAX_DELAY_SECS,
+                )
+                log(
+                    f"[Chunk {idx}/{len(chunks)}] error: {e}. "
+                    f"Retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{CHUNK_RETRY_MAX})"
+                )
+                time.sleep(delay)
+
+        if not chunk_done:
+            # Not checkpointed — the next run will re-attempt this chunk.
+            total_failures += 1
 
     log(
         f"\nHistorical backfill complete. "
@@ -1996,7 +2061,34 @@ def _run_historical(service, label_id):
         f"failures: {total_failures}, "
         f"candidates: {total_candidates}"
     )
-    return total_failures
+    return total_successes, total_failures
+
+
+def _run_with_retries(run_fn):
+    """Execute ``run_fn`` with auth-retry + exponential backoff.
+
+    ``run_fn`` is a zero-argument callable that performs the actual work
+    (incremental sync, custom-range run, etc.). If it raises
+    :class:`AIDriveAuthExpired` or a transient :class:`RuntimeError`,
+    the token cache is cleared and the call is retried after a delay.
+    """
+    for attempt in range(CHUNK_RETRY_MAX + 1):
+        try:
+            return run_fn()
+        except AIDriveAuthExpired as e:
+            if attempt >= CHUNK_RETRY_MAX:
+                log(f"Auth failed after {CHUNK_RETRY_MAX} retries: {e}")
+                raise
+            delay = min(
+                CHUNK_RETRY_BASE_DELAY_SECS * (2 ** attempt),
+                CHUNK_RETRY_MAX_DELAY_SECS,
+            )
+            log(
+                f"Auth expired: {e}. Retrying in {delay}s "
+                f"(attempt {attempt + 1}/{CHUNK_RETRY_MAX})"
+            )
+            time.sleep(delay)
+            _aidrive_token_cache.update({"value": None, "expires_at": None})
 
 
 def main():
@@ -2008,8 +2100,8 @@ def main():
             service = get_gmail_service()
             label_id = ensure_processed_label(service)
             log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
-            failures = _run_historical(service, label_id)
-            if failures > 0:
+            successes, failures = _run_historical(service, label_id)
+            if successes == 0 and failures > 0:
                 sys.exit(1)
 
         elif RUN_MODE == "incremental":
@@ -2023,16 +2115,19 @@ def main():
                 f"{start_str} → {end_str})"
             )
             log(f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}")
-            service = get_gmail_service()
-            label_id = ensure_processed_label(service)
-            log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
 
-            s, f, c = process_window(service, label_id, start_str, end_str)
+            def _do_incremental():
+                svc = get_gmail_service()
+                lid = ensure_processed_label(svc)
+                log(f"Gmail label '{PROCESSED_LABEL}' id: {lid}")
+                return process_window(svc, lid, start_str, end_str)
+
+            s, f, c = _run_with_retries(_do_incremental)
             log(
                 f"\nIncremental sync complete. "
                 f"Successes: {s}, failures: {f}, candidates: {c}"
             )
-            if f > 0:
+            if s == 0 and f > 0:
                 sys.exit(1)
 
         else:
@@ -2051,24 +2146,24 @@ def main():
                 f"MODE: custom range — {START_DATE} → {END_DATE}. "
                 f"Folder: {AIDRIVE_FOLDER}. Cap: {MAX_EMAILS}"
             )
-            service = get_gmail_service()
-            label_id = ensure_processed_label(service)
-            log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
 
-            s, f, c = process_window(service, label_id, START_DATE, END_DATE)
+            def _do_custom():
+                svc = get_gmail_service()
+                lid = ensure_processed_label(svc)
+                log(f"Gmail label '{PROCESSED_LABEL}' id: {lid}")
+                return process_window(svc, lid, START_DATE, END_DATE)
+
+            s, f, c = _run_with_retries(_do_custom)
             log(
                 f"\nCustom-range run complete. "
                 f"Successes: {s}, failures: {f}, candidates: {c}"
             )
-            if f > 0:
+            if s == 0 and f > 0:
                 sys.exit(1)
 
     except AIDriveAuthExpired as e:
-        # Stop the current batch cleanly. Any historical chunks already
-        # finished are preserved in the checkpoint file (saved per-chunk),
-        # so a re-run with a refreshed JWT resumes where this run stopped.
         log("=" * 60)
-        log("AI Drive JWT expired — refresh required")
+        log("AI Drive JWT expired — all retry attempts exhausted")
         log(f"event=auth_failure detail={e}")
         log(
             "Refresh the Bearer JWT (browser DevTools → copy from a logged-in "
@@ -2076,8 +2171,6 @@ def main():
             "to by AIDRIVE_TOKEN_FILE), then re-run. Historical progress is "
             f"preserved in {CHECKPOINT_FILE}."
         )
-        # Use a distinct exit code so callers / CI can react specifically to
-        # an auth-expiry termination vs ordinary failures.
         sys.exit(2)
 
 
