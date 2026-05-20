@@ -2089,6 +2089,19 @@ def _run_with_retries(run_fn):
             )
             time.sleep(delay)
             _aidrive_token_cache.update({"value": None, "expires_at": None})
+        except Exception as e:
+            if attempt >= CHUNK_RETRY_MAX:
+                log(f"Failed after {CHUNK_RETRY_MAX} retries: {e}")
+                raise
+            delay = min(
+                CHUNK_RETRY_BASE_DELAY_SECS * (2 ** attempt),
+                CHUNK_RETRY_MAX_DELAY_SECS,
+            )
+            log(
+                f"Transient error: {e}. Retrying in {delay}s "
+                f"(attempt {attempt + 1}/{CHUNK_RETRY_MAX})"
+            )
+            time.sleep(delay)
 
 
 def main():
