@@ -1356,9 +1356,8 @@ def request_signed_urls(file_batch):
                     "name": f["name"],
                     "path": f["path"],
                     "isFile": True,
-                    # AI Drive's enum requires the leading dot
-                    # (e.g. ".pdf", ".txt"). Normalize defensively in case
-                    # an upstream caller passes the bare extension.
+                    # Already normalized by _normalize_file_type_for_payload
+                    # above (dotted, AI-Drive-supported extension).
                     "file_type": f["file_type"],
                 },
                 "size": f["size"],
