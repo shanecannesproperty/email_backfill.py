@@ -58,6 +58,9 @@ jobs:
       # without this cache `.backfill_checkpoint.json` would never survive.
       # The rolling key (run_id) plus restore-keys means every run saves a
       # new cache entry while restoring the most recent prior one.
+      # save-always ensures the checkpoint is saved even when the job
+      # fails (e.g. auth expiry, transient errors) so the next run
+      # resumes from the last successful chunk instead of starting over.
       - name: Restore backfill checkpoint
         id: checkpoint-cache
         uses: actions/cache@v4
@@ -66,6 +69,7 @@ jobs:
           key: backfill-checkpoint-${{ github.run_id }}
           restore-keys: |
             backfill-checkpoint-
+          save-always: true
 
       - name: Run email backfill
         env:
