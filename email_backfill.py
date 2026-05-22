@@ -96,6 +96,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
+from email.header import decode_header as _decode_rfc2047
 from email.policy import default as email_default_policy
 from email.utils import parsedate_to_datetime
 
@@ -716,7 +717,10 @@ def sanitize_for_filename(text, max_len=80):
 # space and then collapsed) rather than substituted with "_" so the resulting
 # name stays readable, e.g. "Lowered Prices [!] Most-Sold Styles [!!] 48
 # Hours Only" -> "Lowered Prices Most-Sold Styles 48 Hours Only".
-_INVALID_FILENAME_CHARS_RE = re.compile(r'[\[\]!:?*<>|"\\/]')
+# Whitelist approach: allow only word characters (Unicode letters, digits,
+# underscore), spaces, hyphens, dots, and parentheses. Everything else —
+# including @, #, &, =, commas, semicolons, etc. — is replaced.
+_INVALID_FILENAME_CHARS_RE = re.compile(r"[^\w .()'\-]")
 # Other control / whitespace characters that should never appear in a name.
 _CONTROL_WS_RE = re.compile(r"[\r\n\t\f\v\x00-\x1f]")
 # Maximum length of the *base* (pre-extension) part of the filename. Keeps
@@ -1043,6 +1047,30 @@ def list_message_ids(service, query):
             return
 
 
+def _decode_header_value(raw_value):
+    """Decode an RFC 2047 encoded header to a Unicode string.
+
+    Email headers like ``=?utf-8?q?Hello_World?=`` are left encoded by
+    the raw-bytes header parser. This function decodes them so filenames
+    contain the actual text instead of encoded gibberish.
+    """
+    if not raw_value:
+        return ""
+    try:
+        parts = _decode_rfc2047(raw_value)
+        decoded = []
+        for part_bytes, charset in parts:
+            if isinstance(part_bytes, bytes):
+                decoded.append(
+                    part_bytes.decode(charset or "utf-8", errors="replace")
+                )
+            else:
+                decoded.append(part_bytes)
+        return " ".join(decoded)
+    except Exception:
+        return raw_value
+
+
 def fetch_raw_email(service, msg_id):
     """Returns (raw_bytes, parsed_date, subject_safe, from_safe, subject_raw)."""
     msg = service.users().messages().get(
@@ -1052,20 +1080,31 @@ def fetch_raw_email(service, msg_id):
     ).execute()
     raw_bytes = base64.urlsafe_b64decode(msg["raw"])
 
-    # Parse minimal headers from the raw bytes for naming
+    # Parse minimal headers from the raw bytes for naming.
+    # Continuation lines (starting with space/tab) are folded into the
+    # preceding header so multi-line subjects are captured fully.
     headers_text = raw_bytes.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="ignore")
     headers = {}
+    last_key = None
     for line in headers_text.splitlines():
-        if ":" in line and not line.startswith(" "):
+        if line and line[0] in (" ", "\t"):
+            # RFC 2822 continuation line — append to previous header.
+            if last_key is not None:
+                headers[last_key] += " " + line.strip()
+            continue
+        if ":" in line:
             k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
+            last_key = k.strip().lower()
+            headers[last_key] = v.strip()
 
     parsed_date = parse_date_safe(headers.get("date", ""))
-    subject_raw = headers.get("subject", "")
+    # Decode RFC 2047 encoded headers (e.g. =?utf-8?q?...?=) so the
+    # filename contains the actual subject text, not encoded gibberish.
+    subject_raw = _decode_header_value(headers.get("subject", ""))
     subject_safe = (
         sanitize_filename(subject_raw, max_len=80) if subject_raw else "no-subject"
     )
-    from_raw = headers.get("from", "")
+    from_raw = _decode_header_value(headers.get("from", ""))
     from_name = from_raw.split("<")[0].strip() or from_raw.strip() or "unknown-sender"
     from_safe = sanitize_filename(from_name, max_len=40)
     return raw_bytes, parsed_date, subject_safe, from_safe, subject_raw
