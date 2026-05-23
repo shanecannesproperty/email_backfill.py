@@ -27,7 +27,7 @@ ATTACHMENT HANDLING:
 
 OPERATING MODES (set via RUN_MODE environment variable):
 
-  historical   Automatically works through the last 12 months one calendar
+  historical   Automatically works through the last 24 months one calendar
                month at a time. No START_DATE/END_DATE needed. Use this for
                the initial catch-up or to fill any historical gaps.
 
@@ -1601,7 +1601,7 @@ def _incremental_window():
 # The checkpoint file records every (start, end) chunk that has finished
 # successfully. On the next run those chunks are skipped, so an interrupted
 # historical backfill (expired JWT, network outage, manual cancellation)
-# resumes from where it left off instead of restarting all 12 months from
+# resumes from where it left off instead of restarting all 24 months from
 # scratch. The file is intentionally tiny (a JSON list of strings) and is
 # written atomically so a crash mid-write cannot corrupt the state.
 
@@ -2013,7 +2013,7 @@ def _run_historical(service, label_id):
     """
     log(f"Folder: {AIDRIVE_FOLDER}. Per-chunk cap: {MAX_EMAILS}")
 
-    chunks = list(_monthly_chunks(months_back=12))
+    chunks = list(_monthly_chunks(months_back=24))
     log(f"Total chunks to process: {len(chunks)}")
 
     completed = load_checkpoint()
@@ -2154,7 +2154,7 @@ def main():
 
     try:
         if RUN_MODE == "historical":
-            log("MODE: historical — processing last 12 months month by month")
+            log("MODE: historical — processing last 24 months month by month")
             service = get_gmail_service()
             label_id = ensure_processed_label(service)
             log(f"Gmail label '{PROCESSED_LABEL}' id: {label_id}")
