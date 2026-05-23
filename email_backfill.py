@@ -719,8 +719,8 @@ def sanitize_for_filename(text, max_len=80):
 # Hours Only" -> "Lowered Prices Most-Sold Styles 48 Hours Only".
 # Whitelist approach: allow only word characters (Unicode letters, digits,
 # underscore), spaces, hyphens, dots, and parentheses. Everything else —
-# including @, #, &, =, commas, semicolons, etc. — is replaced.
-_INVALID_FILENAME_CHARS_RE = re.compile(r"[^\w .()'\-]")
+# including @, #, &, =, commas, apostrophes, etc. — is replaced.
+_INVALID_FILENAME_CHARS_RE = re.compile(r"[^\w .()\-]")
 # Other control / whitespace characters that should never appear in a name.
 _CONTROL_WS_RE = re.compile(r"[\r\n\t\f\v\x00-\x1f]")
 # Maximum length of the *base* (pre-extension) part of the filename. Keeps
@@ -761,10 +761,11 @@ FALLBACK_EXTENSION = ".txt"
 def sanitize_filename(text, max_len=_MAX_FILENAME_BASE_LEN):
     """Return an AI-Drive-safe version of ``text`` for ``drive_object.name``.
 
-    * Removes characters AI Drive rejects: ``[ ] ! : ? * < > | " \\ /``
+    * Keeps only word characters, spaces, dots, hyphens, and parentheses
     * Strips control characters
+    * Collapses consecutive dots (``...`` → ``.``)
     * Collapses any run of whitespace into a single space
-    * Trims leading/trailing whitespace and dots (Windows-hostile)
+    * Trims leading/trailing whitespace and dots
     * Safely truncates the result to ``max_len`` characters while
       preserving readability (prefers a word boundary)
     * Returns a stable placeholder if the input becomes empty
@@ -773,6 +774,9 @@ def sanitize_filename(text, max_len=_MAX_FILENAME_BASE_LEN):
         return "untitled"
     cleaned = _CONTROL_WS_RE.sub(" ", str(text))
     cleaned = _INVALID_FILENAME_CHARS_RE.sub(" ", cleaned)
+    # Collapse consecutive dots (e.g. "summer..." → "summer.") — AI Drive
+    # rejects filenames with two or more dots in a row.
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     if not cleaned:
         return "untitled"
@@ -828,6 +832,8 @@ def validate_drive_object(drive_object):
         return False, "missing or empty name"
     if _INVALID_FILENAME_CHARS_RE.search(name):
         return False, "name contains invalid characters"
+    if re.search(r"\.{2,}", name):
+        return False, "name contains consecutive dots"
     if _CONTROL_WS_RE.search(name):
         return False, "name contains control characters"
     if name.strip() != name or name.endswith("."):
