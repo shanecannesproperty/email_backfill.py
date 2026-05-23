@@ -1,9 +1,9 @@
 name: Email Backfill
 
 on:
-  # Runs every 30 minutes to sync newly arrived mail automatically.
+  # Runs every 5 minutes to sync newly arrived mail near real-time.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
 
   # Manual trigger — choose historical (full 12-month catch-up),
   # incremental (recent window), or custom (explicit date range).
