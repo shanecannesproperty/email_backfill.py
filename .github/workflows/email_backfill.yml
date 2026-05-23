@@ -82,7 +82,9 @@ jobs:
 
       - name: Clear checkpoint (if requested)
         if: ${{ github.event.inputs.clear_checkpoint == 'true' }}
-        run: rm -f .backfill_checkpoint.json && echo "Checkpoint cleared — historical run will re-process all months"
+        run: |
+          echo '{"version":1,"completed_chunks":[],"saved_at":"cleared"}' > .backfill_checkpoint.json
+          echo "Checkpoint cleared — historical run will re-process all months"
 
       - name: Run email backfill
         env:
