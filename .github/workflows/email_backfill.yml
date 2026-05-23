@@ -33,6 +33,10 @@ on:
         description: "AI Drive destination folder"
         required: false
         default: "04 - EMAIL ARCHIVE"
+      clear_checkpoint:
+        description: "Set to 'true' to clear the checkpoint and re-process all months from scratch (failed emails only — already-uploaded emails are skipped via Gmail label)"
+        required: false
+        default: "false"
 
 concurrency:
   group: email-backfill
@@ -75,6 +79,10 @@ jobs:
           restore-keys: |
             backfill-checkpoint-
           save-always: true
+
+      - name: Clear checkpoint (if requested)
+        if: ${{ github.event.inputs.clear_checkpoint == 'true' }}
+        run: rm -f .backfill_checkpoint.json && echo "Checkpoint cleared — historical run will re-process all months"
 
       - name: Run email backfill
         env:
