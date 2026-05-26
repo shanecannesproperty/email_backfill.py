@@ -51,7 +51,7 @@ jobs:
         include:
           - account: primary
             gmail_refresh_secret: GMAIL_REFRESH_TOKEN
-            checkpoint_key: backfill-checkpoint
+            checkpoint_key: backfill-checkpoint-primary
             checkpoint_file: .backfill_checkpoint.json
           - account: matters
             gmail_refresh_secret: GMAIL_REFRESH_TOKEN_MATTERS
