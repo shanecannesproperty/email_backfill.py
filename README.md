@@ -4,8 +4,17 @@ Automatically syncs Gmail messages into [My AI Drive](https://myaidrive.com) as
 individual `.txt` files (with attachments uploaded separately when their format
 is supported) using the AI Drive signed-URL upload API.
 
-The script runs unattended in **GitHub Actions** on a **30-minute schedule**
-and can also be triggered manually for a full 12-month historical catch-up.
+The script runs unattended in **GitHub Actions** on a **5-minute schedule**
+and can also be triggered manually for a full 24-month historical catch-up.
+
+The workflow processes **multiple Gmail accounts** in parallel using a matrix
+strategy. Currently configured accounts:
+
+| Account | Gmail refresh secret | Checkpoint file |
+| --- | --- | --- |
+| `primary` | `GMAIL_REFRESH_TOKEN` | `.backfill_checkpoint.json` |
+| `matters` | `GMAIL_REFRESH_TOKEN_MATTERS` | `.backfill_checkpoint_matters.json` |
+
 It is **idempotent**: each successfully uploaded message is tagged in Gmail with
 the label `aidrive-archived`, so reruns of any date range are always safe — no
 duplicate uploads.
@@ -16,7 +25,7 @@ duplicate uploads.
 | --- | --- |
 | `email_backfill.py` | Main job — Gmail → AI Drive. Supports historical, incremental, and custom date-range modes. |
 | `get_gmail_token.py` | One-time local helper to mint a Gmail OAuth refresh token. |
-| `.github/workflows/email_backfill.yml` | Scheduled (every 30 min) + manual workflow. |
+| `.github/workflows/email_backfill.yml` | Scheduled (every 5 min) + manual workflow. Runs both accounts in parallel via matrix strategy. |
 | `requirements.txt` | Pinned Python dependencies. |
 
 > Only the workflow under `.github/workflows/` is loaded by GitHub Actions.
@@ -56,35 +65,36 @@ manually-pasted token:
 | `AIDRIVE_TOKEN` | fallback | Short-lived bearer JWT pasted from the AI Drive browser session. Only needed when the two values above are not set. |
 | `GMAIL_CLIENT_ID` | yes | OAuth client id from step 2. |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | yes | OAuth client secret from step 2. |
-| `GMAIL_REFRESH_TOKEN` | yes | Refresh token from step 2. |
+| `GMAIL_REFRESH_TOKEN` | yes | Refresh token for the primary mailbox from step 2. |
+| `GMAIL_REFRESH_TOKEN_MATTERS` | yes | Refresh token for `matters@spexperts.com.au` (same mint procedure, different Google account). |
 
 > **Never commit any of these values.** `.env`, token files, and the
 > historical-mode checkpoint file are all listed in `.gitignore`.
 
 ## Operating modes
 
-### Automatic 30-minute sync (incremental)
+### Automatic 5-minute sync (incremental)
 
 Once the workflow is in place, GitHub Actions **automatically runs every
-30 minutes** without any manual intervention. Each scheduled run uses
+5 minutes** without any manual intervention. Each scheduled run uses
 **incremental mode**: it queries the last 2 calendar days for any mail not yet
 labeled `aidrive-archived` and uploads it. The 2-day window is intentionally
-wider than 30 minutes so that no mail is missed across midnight boundaries or
+wider than 5 minutes so that no mail is missed across midnight boundaries or
 transient API outages.
 
 You don't need to do anything to keep this running — it starts automatically
 after the workflow file is committed.
 
-### Historical 12-month backfill (historical)
+### Historical 24-month backfill (historical)
 
-To import everything from the last 12 months in one go:
+To import everything from the last 24 months in one go:
 
 1. Open **Actions** → **Email Backfill** → **Run workflow**.
 2. Set **Run mode** to `historical` (this is the default).
 3. Click **Run workflow**.
 
-The job works through the last 12 calendar months one month at a time and logs
-each chunk. Because of the `aidrive-archived` label, you can safely re-trigger
+The job works through the last 24 calendar months one month at a time and logs
+each chunk. Both accounts run in parallel. Because of the `aidrive-archived` label, you can safely re-trigger
 this at any time — already-processed messages are skipped.
 
 ### Custom date range (custom)
@@ -125,7 +135,7 @@ etc.) are skipped — they remain visible inside Gmail.
 
 1. Refreshes Gmail credentials and ensures the `aidrive-archived` label exists.
 2. Depending on `RUN_MODE`:
-   - **historical** — generates up to 13 date-range chunks (12 complete past
+   - **historical** — generates up to 25 date-range chunks (24 complete past
      months plus the current partial month) and processes each in sequence.
    - **incremental** — computes a 2-day lookback window ending tomorrow.
    - **custom** — uses the supplied `START_DATE` / `END_DATE` directly.
