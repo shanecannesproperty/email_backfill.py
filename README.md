@@ -63,10 +63,12 @@ manually-pasted token:
 | `AIDRIVE_REFRESH_TOKEN` | preferred | Firebase refresh token from `stsTokenManager.refreshToken` (see [Firebase auto-refresh](#ai-drive-jwt-expiration--firebase-auto-refresh)). Long-lived. |
 | `AIDRIVE_FIREBASE_API_KEY` | preferred | Firebase Web API key (`apiKey` field, e.g. `AIzaSy…`) from the same browser localStorage entry. |
 | `AIDRIVE_TOKEN` | fallback | Short-lived bearer JWT pasted from the AI Drive browser session. Only needed when the two values above are not set. |
-| `GMAIL_CLIENT_ID` | yes | OAuth client id from step 2. |
-| `GOOGLE_OAUTH_CLIENT_SECRET` | yes | OAuth client secret from step 2. |
-| `GMAIL_REFRESH_TOKEN` | yes | Refresh token for the primary mailbox from step 2. |
-| `GMAIL_REFRESH_TOKEN_MATTERS` | yes | Refresh token for `matters@spexperts.com.au` (same mint procedure, different Google account). |
+| `GMAIL_CLIENT_ID` | yes | OAuth client ID for the primary mailbox. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | yes | OAuth client secret for the primary mailbox. |
+| `GMAIL_REFRESH_TOKEN` | yes | Refresh token for the primary mailbox. |
+| `GMAIL_CLIENT_ID_MATTERS` | yes | OAuth client ID for `matters@spexperts.com.au` (from its own GCP project). |
+| `GOOGLE_OAUTH_CLIENT_SECRET_MATTERS` | yes | OAuth client secret for `matters@spexperts.com.au`. |
+| `GMAIL_REFRESH_TOKEN_MATTERS` | yes | Refresh token for `matters@spexperts.com.au`. |
 
 > **Never commit any of these values.** `.env`, token files, and the
 > historical-mode checkpoint file are all listed in `.gitignore`.
