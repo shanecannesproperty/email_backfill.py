@@ -5,14 +5,14 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
-  # Manual trigger — choose historical (full 12-month catch-up),
+  # Manual trigger — choose historical (full 24-month catch-up),
   # incremental (recent window), or custom (explicit date range).
   workflow_dispatch:
     inputs:
       run_mode:
         description: >
           Run mode:
-          'historical' = auto-process last 12 months month by month;
+          'historical' = auto-process last 24 months month by month;
           'incremental' = sync recent mail (last 2 days);
           'custom' = supply explicit start_date and end_date below.
         required: false
@@ -38,16 +38,31 @@ on:
         required: false
         default: "false"
 
-concurrency:
-  group: email-backfill
-  cancel-in-progress: false
-
 jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 330   # 5.5 h — generous, prevents silent 6-h kill
     permissions:
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: primary
+            gmail_refresh_secret: GMAIL_REFRESH_TOKEN
+            checkpoint_key: backfill-checkpoint-primary
+            checkpoint_file: .backfill_checkpoint.json
+          - account: matters
+            gmail_refresh_secret: GMAIL_REFRESH_TOKEN_MATTERS
+            checkpoint_key: backfill-checkpoint-matters
+            checkpoint_file: .backfill_checkpoint_matters.json
+
+    # Separate concurrency groups per account so both can run in parallel
+    # but two runs of the same account cannot overlap.
+    concurrency:
+      group: email-backfill-${{ matrix.account }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -63,47 +78,35 @@ jobs:
 
       # Persist the historical-mode checkpoint between runs so each
       # successive run advances further backwards instead of restarting
-      # the same months. The runner filesystem is wiped at job end, so
-      # without this cache `.backfill_checkpoint.json` would never survive.
-      # The rolling key (run_id) plus restore-keys means every run saves a
-      # new cache entry while restoring the most recent prior one.
-      # save-always ensures the checkpoint is saved even when the job
-      # fails (e.g. auth expiry, transient errors) so the next run
-      # resumes from the last successful chunk instead of starting over.
+      # the same months. Each account has its own checkpoint cache.
       - name: Restore backfill checkpoint
         id: checkpoint-cache
         uses: actions/cache@v4
         with:
-          path: .backfill_checkpoint.json
-          key: backfill-checkpoint-${{ github.run_id }}
+          path: ${{ matrix.checkpoint_file }}
+          key: ${{ matrix.checkpoint_key }}-${{ github.run_id }}-${{ strategy.job-index }}
           restore-keys: |
-            backfill-checkpoint-
+            ${{ matrix.checkpoint_key }}-
           save-always: true
 
       - name: Clear checkpoint (if requested)
         if: ${{ github.event.inputs.clear_checkpoint == 'true' }}
         run: |
-          echo '{"version":1,"completed_chunks":[],"saved_at":"cleared"}' > .backfill_checkpoint.json
-          echo "Checkpoint cleared — historical run will re-process all months"
+          echo '{"version":1,"completed_chunks":[],"saved_at":"cleared"}' > ${{ matrix.checkpoint_file }}
+          echo "Checkpoint cleared for ${{ matrix.account }} — historical run will re-process all months"
 
-      - name: Run email backfill
+      - name: Run email backfill (${{ matrix.account }})
         env:
-          # Preferred: Firebase auto-refresh credentials. When both are set
-          # the uploader mints fresh AI Drive JWTs on demand and never
-          # stops mid-run for a manually-pasted token.
           AIDRIVE_REFRESH_TOKEN: ${{ secrets.AIDRIVE_REFRESH_TOKEN }}
           AIDRIVE_FIREBASE_API_KEY: ${{ secrets.AIDRIVE_FIREBASE_API_KEY }}
-          # Fallback: short-lived bearer JWT. Only used when the two
-          # secrets above are not configured.
           AIDRIVE_TOKEN: ${{ secrets.AIDRIVE_TOKEN }}
           AIDRIVE_FOLDER: ${{ github.event.inputs.aidrive_folder || '04 - EMAIL ARCHIVE' }}
-          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
-          GMAIL_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
-          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
-          # Scheduled runs always use incremental mode.
-          # Manual runs use the chosen run_mode (default: historical).
+          GMAIL_CLIENT_ID: ${{ matrix.account == 'primary' && secrets.GMAIL_CLIENT_ID || secrets.GMAIL_CLIENT_ID_MATTERS }}
+          GMAIL_CLIENT_SECRET: ${{ matrix.account == 'primary' && secrets.GOOGLE_OAUTH_CLIENT_SECRET || secrets.GOOGLE_OAUTH_CLIENT_SECRET_MATTERS }}
+          GMAIL_REFRESH_TOKEN: ${{ matrix.account == 'primary' && secrets.GMAIL_REFRESH_TOKEN || secrets.GMAIL_REFRESH_TOKEN_MATTERS }}
           RUN_MODE: ${{ github.event_name == 'schedule' && 'incremental' || github.event.inputs.run_mode || 'historical' }}
           START_DATE: ${{ github.event.inputs.start_date || '' }}
           END_DATE: ${{ github.event.inputs.end_date || '' }}
           MAX_EMAILS: ${{ github.event.inputs.max_emails || '2000' }}
+          CHECKPOINT_FILE: ${{ matrix.checkpoint_file }}
         run: python email_backfill.py
