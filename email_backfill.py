@@ -1703,7 +1703,7 @@ def process_window(service, label_id, start_str, end_str):
     """
     # Historical "real mail only" backfill: in custom mode, skip Gmail
     # promotions/social/forums (newsletters) to save ingestion credits.
-    _extra = "" if RUN_MODE in ("historical", "incremental") else " category:primary"
+    _extra = "" if RUN_MODE in ("historical", "incremental") else " -category:promotions -category:social -category:updates -category:forums"
     query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}{_extra}"
     log(f"  Gmail query: {query}")
 
