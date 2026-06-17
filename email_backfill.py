@@ -1701,7 +1701,10 @@ def process_window(service, label_id, start_str, end_str):
     ``.eml`` / ``message/rfc822``. Supported attachments (PDF, Office docs,
     etc.) are queued as separate uploads alongside the text rendering.
     """
-    query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}"
+    # Historical "real mail only" backfill: in custom mode, skip Gmail
+    # promotions/social/forums (newsletters) to save ingestion credits.
+    _extra = "" if RUN_MODE in ("historical", "incremental") else " category:primary"
+    query = f"after:{start_str} before:{end_str} -label:{PROCESSED_LABEL}{_extra}"
     log(f"  Gmail query: {query}")
 
     msg_ids = list(list_message_ids(service, query))
